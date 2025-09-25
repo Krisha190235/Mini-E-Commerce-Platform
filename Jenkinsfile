@@ -5,6 +5,8 @@ pipeline {
 
   environment {
     // SonarQube
+    // If Jenkins “SonarQube servers” is configured, withSonarQubeEnv will inject SONAR_HOST_URL.
+    // This default is used only if that isn’t set by Jenkins.
     SONAR_HOST_URL   = 'http://host.docker.internal:9000'
     SONAR_SCANNER    = 'sonar-scanner-4.8'
 
@@ -31,7 +33,6 @@ pipeline {
 
   stages {
 
-    // 1) BUILD
     stage('Build') {
       steps {
         ansiColor('xterm') {
@@ -62,7 +63,6 @@ pipeline {
       }
     }
 
-    // 2) TEST
     stage('Test') {
       steps {
         ansiColor('xterm') {
@@ -84,32 +84,39 @@ pipeline {
       }
     }
 
-    // 3) CODE QUALITY
+    // ====== UPDATED ======
     stage('Code Quality') {
       steps {
         ansiColor('xterm') {
+          // Inject SONAR_HOST_URL (if configured in Jenkins global config)
           withSonarQubeEnv('SonarQube') {
-            script {
-              def scannerHome = tool env.SONAR_SCANNER
-              dir('backend') {
-                def nodeBin = tool('node18') + '/bin/node'
-                sh """
-                  export PATH="${tool('node18')}/bin:\\$PATH"
-                  "${scannerHome}/bin/sonar-scanner" \
-                    -Dsonar.projectKey=ecommerce-backend \
-                    -Dsonar.sources=. \
-                    -Dsonar.exclusions=tests/**,**/*.test.js,**/node_modules/**,**/dist/** \
-                    -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info \
-                    -Dsonar.nodejs.executable=${nodeBin}
-                """
+            // Load your Secret Text credential: ID = sonarqube-token1
+            withCredentials([string(credentialsId: 'sonarqube-token1', variable: 'SONAR_TOKEN')]) {
+              script {
+                def scannerHome = tool env.SONAR_SCANNER
+                def nodeBin     = tool('node18') + '/bin/node'
+                dir('backend') {
+                  sh """
+                    set -eux
+                    export PATH="${tool('node18')}/bin:\\$PATH"
+                    "${scannerHome}/bin/sonar-scanner" \
+                      -Dsonar.host.url="${SONAR_HOST_URL}" \
+                      -Dsonar.login="${SONAR_TOKEN}" \
+                      -Dsonar.projectKey=ecommerce-backend \
+                      -Dsonar.sources=. \
+                      -Dsonar.exclusions=tests/**,**/*.test.js,**/node_modules/**,**/dist/** \
+                      -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info \
+                      -Dsonar.nodejs.executable=${nodeBin}
+                  """
+                }
               }
             }
           }
         }
       }
     }
+    // ====== /UPDATED ======
 
-    // 4) QUALITY GATE (non-blocking + only on main)
     stage('Quality Gate') {
       when {
         anyOf {
@@ -127,7 +134,6 @@ pipeline {
       }
     }
 
-    // 5) SECURITY
     stage('Security') {
       parallel {
         stage('Snyk (deps)') {
@@ -163,7 +169,6 @@ pipeline {
       }
     }
 
-    // 6) DEPLOY
     stage('Deploy') {
       steps {
         ansiColor('xterm') {
@@ -234,7 +239,6 @@ pipeline {
       }
     }
 
-    // 7) RELEASE
     stage('Release') {
       steps {
         sh '''
@@ -247,7 +251,6 @@ pipeline {
       }
     }
 
-    // 8) MONITORING (non-fatal)
     stage('Monitoring') {
       steps {
         ansiColor('xterm') {
@@ -266,7 +269,7 @@ pipeline {
               else
                 echo "⚠️  API still not reachable"; ok=0
               fi
-            fi
+            fi`
 
             if curl -sf "http://host.docker.internal:${FRONTEND_PORT_HOST}/health" >/dev/null; then
               echo "✅ Web OK (host.docker.internal:${FRONTEND_PORT_HOST})"
