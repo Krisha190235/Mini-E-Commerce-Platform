@@ -4,11 +4,11 @@ pipeline {
   options { timestamps() }
 
   environment {
-    // SonarQube (name must match your Jenkins global config entry)
+    // SonarQube
     SONAR_HOST_URL   = 'http://host.docker.internal:9000'
     SONAR_SCANNER    = 'sonar-scanner-4.8'
 
-    // Image naming & tagging
+    // Backend image naming & tagging
     APP_NAME         = 'ecommerce-api'
     APP_VERSION      = "${env.BUILD_NUMBER}"
     APP_IMAGE        = "${APP_NAME}:${APP_VERSION}"
@@ -21,6 +21,12 @@ pipeline {
     APP_PORT_HOST    = '8082'
     APP_PORT_CONT    = '3000'
     MONGO_DB_NAME    = 'ecom'
+
+    // 🔹 Frontend (new)
+    FRONTEND_NAME      = 'ecommerce-web'
+    FRONTEND_IMAGE     = "${FRONTEND_NAME}:${env.BUILD_NUMBER}"
+    FRONTEND_LATEST    = "${FRONTEND_NAME}:latest"
+    FRONTEND_PORT_HOST = '8081'
   }
 
   stages {
@@ -31,9 +37,22 @@ pipeline {
         ansiColor('xterm') {
           sh '''
             set -eux
+
+            # Backend build
             cd backend
             npm ci
             npm run build || echo "No build step required"
+            cd ..
+
+            # 🔹 Build backend Docker image (for scan/deploy)
+            docker build -t "${APP_IMAGE}" -t "${APP_IMAGE_LATEST}" .
+
+            # 🔹 Frontend build & image
+            cd frontend
+            npm ci
+            # Build the static site (Vite) and bake API base into image
+            docker build -t "${FRONTEND_IMAGE}" -t "${FRONTEND_LATEST}" \
+              --build-arg VITE_API_URL=http://localhost:${APP_PORT_HOST} .
           '''
         }
       }
@@ -120,9 +139,7 @@ pipeline {
             ansiColor('xterm') {
               sh '''
                 set -eux
-                # Build image for scanning (also used for deploy)
-                docker build -t "${APP_IMAGE}" -t "${APP_IMAGE_LATEST}" .
-                # Scan but do not fail the pipeline on findings here
+                # Scan backend image (already built in Build stage)
                 docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
                   aquasec/trivy:latest image --exit-code 0 --severity HIGH,CRITICAL \
                   "${APP_IMAGE}" | tee trivy.txt
@@ -136,7 +153,7 @@ pipeline {
       }
     }
 
-    // 6) DEPLOY (staging on Docker; exposes http://localhost:8082)
+    // 6) DEPLOY (staging on Docker; exposes http://localhost:8082 and http://localhost:8081)
     stage('Deploy') {
       steps {
         ansiColor('xterm') {
@@ -146,7 +163,7 @@ pipeline {
             # ensure network exists (no-op if it does)
             docker network inspect "${DOCKER_NETWORK}" >/dev/null 2>&1 || docker network create "${DOCKER_NETWORK}"
 
-            # (re)start Mongo with proper healthcheck (returns ok==1)
+            # (re)start Mongo with healthcheck (returns ok==1)
             docker rm -f "${MONGO_CONTAINER}" || true
             docker run -d --name "${MONGO_CONTAINER}" --network "${DOCKER_NETWORK}" -p 27017:27017 \
               --health-cmd='mongosh --quiet --eval "db.adminCommand({ ping: 1 }).ok"' \
@@ -155,9 +172,7 @@ pipeline {
             echo "Waiting for Mongo to be healthy..."
             for i in $(seq 1 120); do
               s=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${MONGO_CONTAINER}")
-              if [ "$s" = "healthy" ]; then
-                break
-              fi
+              [ "$s" = "healthy" ] && break
               sleep 1
               if [ "$i" -eq 120 ]; then
                 echo "Mongo failed to become healthy" >&2
@@ -167,24 +182,44 @@ pipeline {
               fi
             done
 
-            # (re)start app
+            # (re)start backend
             docker rm -f "${STAGING_CONTAINER}" || true
             docker run -d --name "${STAGING_CONTAINER}" --network "${DOCKER_NETWORK}" \
               -e NODE_ENV=production -e JWT_SECRET=change-me \
               -e MONGO_URL="mongodb://${MONGO_CONTAINER}:27017/${MONGO_DB_NAME}" \
               -p ${APP_PORT_HOST}:${APP_PORT_CONT} "${APP_IMAGE_LATEST}"
 
-            echo "Waiting for app to be ready on http://host.docker.internal:${APP_PORT_HOST}/health ..."
+            echo "Waiting for API on http://host.docker.internal:${APP_PORT_HOST}/health ..."
             for i in $(seq 1 120); do
               if curl -sf "http://host.docker.internal:${APP_PORT_HOST}/health" >/dev/null; then
-                echo "App is healthy ✅"
+                echo "API is healthy ✅"
                 break
               fi
               sleep 2
               if [ "$i" -eq 120 ]; then
-                echo "App failed to become ready" >&2
+                echo "API failed to become ready" >&2
                 docker ps --format 'table {{.Names}}\\t{{.Status}}\\t{{.Ports}}'
                 docker logs --tail 200 "${STAGING_CONTAINER}" || true
+                exit 1
+              fi
+            done
+
+            # 🔹 (re)start frontend
+            docker rm -f "${FRONTEND_NAME}" || true
+            docker run -d --name "${FRONTEND_NAME}" --network "${DOCKER_NETWORK}" \
+              -p ${FRONTEND_PORT_HOST}:80 "${FRONTEND_LATEST}"
+
+            echo "Waiting for Web on http://host.docker.internal:${FRONTEND_PORT_HOST}/health ..."
+            for i in $(seq 1 60); do
+              if curl -sf "http://host.docker.internal:${FRONTEND_PORT_HOST}/health" >/dev/null; then
+                echo "Web is up ✅"
+                break
+              fi
+              sleep 2
+              if [ "$i" -eq 60 ]; then
+                echo "Web failed to become ready" >&2
+                docker ps --format 'table {{.Names}}\\t{{.Status}}\\t{{.Ports}}'
+                docker logs --tail 200 "${FRONTEND_NAME}" || true
                 exit 1
               fi
             done
@@ -200,53 +235,50 @@ pipeline {
           sh '''
             set -eux
             docker tag "${APP_IMAGE_LATEST}" "${APP_NAME}:release-${APP_VERSION}"
+            docker tag "${FRONTEND_LATEST}" "${FRONTEND_NAME}:release-${APP_VERSION}"
             echo "Release tagged: ${APP_NAME}:release-${APP_VERSION}"
+            echo "Release tagged: ${FRONTEND_NAME}:release-${APP_VERSION}"
           '''
         }
       }
     }
 
-    // 8) MONITORING (non-fatal health probe; keeps stage green)
+    // 8) MONITORING (non-fatal; keeps stage green)
     stage('Monitoring') {
       steps {
         ansiColor('xterm') {
           sh '''
             set -eux
 
-            echo "Monitoring: probing host.docker.internal:${APP_PORT_HOST}/health ..."
-            ok=0
-            for i in $(seq 1 30); do
-              if curl -sf "http://host.docker.internal:${APP_PORT_HOST}/health" >/dev/null; then
-                echo "✅ Health OK (host.docker.internal:${APP_PORT_HOST})"
-                ok=1
-                break
-              else
-                echo "Health not ready yet via host port... ($i)"
-                sleep 2
-              fi
-            done
+            echo "Monitoring: probing API & Web via host ports ..."
+            ok=1
 
-            if [ "$ok" -eq 0 ]; then
-              echo "Fallback: attach Jenkins to ${DOCKER_NETWORK} and probe ${STAGING_CONTAINER}:${APP_PORT_CONT}/health"
+            # API probe
+            if curl -sf "http://host.docker.internal:${APP_PORT_HOST}/health" >/dev/null; then
+              echo "✅ API OK (host.docker.internal:${APP_PORT_HOST})"
+            else
+              echo "⚠️  API probe failed (host port). Trying container DNS..."
               docker network connect "${DOCKER_NETWORK}" jenkins || true
-              for i in $(seq 1 15); do
-                if curl -sf "http://${STAGING_CONTAINER}:${APP_PORT_CONT}/health" >/dev/null; then
-                  echo "✅ Health OK (${STAGING_CONTAINER}:${APP_PORT_CONT})"
-                  ok=1
-                  break
-                else
-                  echo "Health not ready yet via container DNS... ($i)"
-                  docker logs --tail 50 "${STAGING_CONTAINER}" || true
-                  sleep 2
-                fi
-              done
+              if curl -sf "http://${STAGING_CONTAINER}:${APP_PORT_CONT}/health" >/dev/null; then
+                echo "✅ API OK via container DNS"
+              else
+                echo "⚠️  API still not reachable"; ok=0
+              fi
             fi
 
+            # Web probe
+            if curl -sf "http://host.docker.internal:${FRONTEND_PORT_HOST}/health" >/dev/null; then
+              echo "✅ Web OK (host.docker.internal:${FRONTEND_PORT_HOST})"
+            else
+              echo "⚠️  Web probe failed"; ok=0
+            fi
+
+            # Do not fail pipeline; just print diagnostics if something was off
             if [ "$ok" -eq 0 ]; then
-              echo "⚠️  Health checks did not pass, but not failing the pipeline."
+              echo "⚠️  One or more monitoring checks failed (non-fatal)."
               docker ps --format 'table {{.Names}}\\t{{.Status}}\\t{{.Ports}}' || true
               docker logs --tail 100 "${STAGING_CONTAINER}" || true
-              # keep stage green (no non-zero exit)
+              docker logs --tail 100 "${FRONTEND_NAME}" || true
             fi
           '''
         }
@@ -256,7 +288,9 @@ pipeline {
 
   post {
     success {
-      echo "Pipeline SUCCESS. App running at: http://localhost:${APP_PORT_HOST}"
+      echo "Pipeline SUCCESS."
+      echo "API:      http://localhost:${APP_PORT_HOST}       (Swagger: /api-docs)"
+      echo "Website:  http://localhost:${FRONTEND_PORT_HOST}"
     }
     always {
       cleanWs()
