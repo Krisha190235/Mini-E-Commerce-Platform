@@ -1,12 +1,12 @@
 pipeline {
   agent any
-  tools { nodejs 'node20' }
+  tools { nodejs 'node20' }                       // Configure in Manage Jenkins → Tools
   options { timestamps() }
 
   environment {
-    // SonarQube (name must match your Jenkins global config entry)
+    // SonarQube server name must match your Jenkins global config
     SONAR_HOST_URL   = 'http://host.docker.internal:9000'
-    SONAR_SCANNER    = 'sonar-scanner-4.8'
+    SONAR_SCANNER    = 'sonar-scanner-4.8'        // Manage Jenkins → Tools → SonarQube Scanner
 
     // Image naming & tagging
     APP_NAME         = 'ecommerce-api'
@@ -88,7 +88,7 @@ pipeline {
       }
     }
 
-    // 4) QUALITY GATE
+    // (Quality Gate is part of Code Quality maturity; kept as a short gate here)
     stage('Quality Gate') {
       steps {
         timeout(time: 10, unit: 'MINUTES') {
@@ -97,12 +97,13 @@ pipeline {
       }
     }
 
-    // 5) SECURITY
+    // 4) SECURITY
     stage('Security') {
       parallel {
         stage('Snyk (deps)') {
           steps {
             ansiColor('xterm') {
+              // Optional: add SNYK_TOKEN in Jenkins credentials if you want auth
               withCredentials([string(credentialsId: 'SNYK_TOKEN', variable: 'SNYK_TOKEN')]) {
                 sh '''
                   set -eux
@@ -120,9 +121,8 @@ pipeline {
             ansiColor('xterm') {
               sh '''
                 set -eux
-                # Build image for scanning (also used for deploy)
+                # Build a temporary image for scan if not already built
                 docker build -t "${APP_IMAGE}" -t "${APP_IMAGE_LATEST}" .
-                # Scan but do not fail the pipeline on findings here
                 docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
                   aquasec/trivy:latest image --exit-code 0 --severity HIGH,CRITICAL \
                   "${APP_IMAGE}" | tee trivy.txt
@@ -136,67 +136,60 @@ pipeline {
       }
     }
 
-    // 6) DEPLOY (staging on Docker; exposes http://localhost:8082)
+    // 5) DEPLOY (staging on Docker; exposes http://localhost:8082)
     stage('Deploy') {
-      steps {
-        ansiColor('xterm') {
-          sh '''
-            set -eux
+  steps {
+    ansiColor('xterm') {
+      sh '''
+        set -eux
 
-            # ensure network exists (no-op if it does)
-            docker network inspect "${DOCKER_NETWORK}" >/dev/null 2>&1 || docker network create "${DOCKER_NETWORK}"
+        # ensure network exists (no-op if it does)
+        docker network inspect ecommerce-net >/dev/null 2>&1 || docker network create ecommerce-net
 
-            # (re)start Mongo with proper healthcheck (returns ok==1)
-            docker rm -f "${MONGO_CONTAINER}" || true
-            docker run -d --name "${MONGO_CONTAINER}" --network "${DOCKER_NETWORK}" -p 27017:27017 \
-              --health-cmd='mongosh --quiet --eval "db.adminCommand({ ping: 1 }).ok"' \
-              --health-interval=5s --health-timeout=3s --health-retries=30 mongo
+        # (re)start Mongo with proper healthcheck
+        docker rm -f ecommerce-mongo || true
+        docker run -d --name ecommerce-mongo --network ecommerce-net -p 27017:27017 \
+          --health-cmd='mongosh --quiet --eval "db.adminCommand({ ping: 1 }).ok"' \
+          --health-interval=5s --health-timeout=3s --health-retries=30 mongo
 
-            echo "Waiting for Mongo to be healthy..."
-            for i in $(seq 1 120); do
-              s=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${MONGO_CONTAINER}")
-              if [ "$s" = "healthy" ]; then
-                break
-              fi
-              sleep 1
-              if [ "$i" -eq 120 ]; then
-                echo "Mongo failed to become healthy" >&2
-                docker ps --format 'table {{.Names}}\\t{{.Status}}\\t{{.Ports}}'
-                docker logs --tail 200 "${MONGO_CONTAINER}" || true
-                exit 1
-              fi
-            done
+        echo "Waiting for Mongo to be healthy..."
+        for i in $(seq 1 120); do
+          s=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' ecommerce-mongo)
+          [ "$s" = "healthy" ] && break
+          sleep 1
+        done
 
-            # (re)start app
-            docker rm -f "${STAGING_CONTAINER}" || true
-            docker run -d --name "${STAGING_CONTAINER}" --network "${DOCKER_NETWORK}" \
-              -e NODE_ENV=production -e JWT_SECRET=change-me \
-              -e MONGO_URL="mongodb://${MONGO_CONTAINER}:27017/${MONGO_DB_NAME}" \
-              -p ${APP_PORT_HOST}:${APP_PORT_CONT} "${APP_IMAGE_LATEST}"
+        # (re)start app
+        docker rm -f ecommerce-staging || true
+        docker run -d --name ecommerce-staging --network ecommerce-net \
+          -e NODE_ENV=production -e JWT_SECRET=change-me \
+          -e MONGO_URL=mongodb://ecommerce-mongo:27017/ecom \
+          -p 8082:3000 ecommerce-api:latest
 
-            echo "Waiting for app to be ready on http://host.docker.internal:${APP_PORT_HOST}/health ..."
-            for i in $(seq 1 120); do
-              if curl -sf "http://host.docker.internal:${APP_PORT_HOST}/health" >/dev/null; then
-                echo "App is healthy ✅"
-                break
-              fi
-              sleep 2
-              if [ "$i" -eq 120 ]; then
-                echo "App failed to become ready" >&2
-                docker ps --format 'table {{.Names}}\\t{{.Status}}\\t{{.Ports}}'
-                docker logs --tail 200 "${STAGING_CONTAINER}" || true
-                exit 1
-              fi
-            done
-          '''
-        }
-      }
+        echo "Waiting for app to be ready on http://host.docker.internal:8082/health ..."
+        for i in $(seq 1 120); do
+          if curl -sf http://host.docker.internal:8082/health >/dev/null; then
+            echo "App is healthy ✅"
+            break
+          fi
+          sleep 2
+          if [ "$i" -eq 120 ]; then
+            echo "App failed to become ready" >&2
+            docker ps --format 'table {{.Names}}\\t{{.Status}}\\t{{.Ports}}'
+            docker logs --tail 200 ecommerce-staging || true
+            exit 1
+          fi
+        done
+      '''
     }
+  }
+}
 
-    // 7) RELEASE (tag image; pushing is optional)
+    // 6) RELEASE (lightweight, tag image; push is optional)
     stage('Release') {
       steps {
         script {
+          // Tag the local image with a version tag; optionally push if you add DockerHub creds
           sh '''
             set -eux
             docker tag "${APP_IMAGE_LATEST}" "${APP_NAME}:release-${APP_VERSION}"
@@ -206,28 +199,28 @@ pipeline {
       }
     }
 
-    // 8) MONITORING (container-to-container probe + brief logs)
+    // 7) MONITORING (simple health probe + tail logs as demo)
     stage('Monitoring') {
       steps {
         ansiColor('xterm') {
           sh '''
-            set -eux
-            for i in $(seq 1 30); do
-              if curl -sf "http://${STAGING_CONTAINER}:${APP_PORT_CONT}/health" >/dev/null; then
-                echo "✅ Health OK (${STAGING_CONTAINER}:${APP_PORT_CONT})"
-                exit 0
-              else
-                echo "Health not ready yet... ($i)"
-                docker logs --tail 50 "${STAGING_CONTAINER}" || true
-                sleep 2
-              fi
-            done
-            echo "❌ Health check failed after retries"
-            exit 2
-          '''
-        }
-      }
+          set -eux
+           for i in $(seq 1 30); do
+          if curl -sf http://ecommerce-staging:3000/health >/dev/null; then
+            echo "✅ Health OK (ecommerce-staging:3000)"
+            exit 0
+          else
+            echo "Health not ready yet... ($i)"
+            docker logs --tail 50 ecommerce-staging || true
+            sleep 2
+          fi
+        done
+        echo "❌ Health check failed after retries"
+        exit 2
+      '''
     }
+  }
+}
   }
 
   post {
