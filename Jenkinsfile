@@ -1,6 +1,6 @@
 pipeline {
   agent any
-  tools { nodejs 'node18' }                       // Configure in Manage Jenkins → Tools
+  tools { nodejs 'node20' }                       // Configure in Manage Jenkins → Tools
   options { timestamps() }
 
   environment {
