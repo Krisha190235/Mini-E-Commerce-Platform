@@ -1,4 +1,5 @@
- agent any
+pipeline {
+  agent any
 
   tools {
     nodejs 'node18'   // <-- must match the NodeJS tool configured in Jenkins
