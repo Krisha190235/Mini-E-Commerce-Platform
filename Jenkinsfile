@@ -1,9 +1,9 @@
 pipeline {
   agent any
-  options { timestamps() }  // ansiColor is a step, not an option
+  options { timestamps() } // ansiColor must be used inside steps
 
   environment {
-    SONAR_HOST_URL = 'http://host.docker.internal:9000'
+    SONAR_HOST_URL   = 'http://host.docker.internal:9000'
     APP_IMAGE        = "ecommerce-api:${BUILD_NUMBER}"
     APP_IMAGE_LATEST = "ecommerce-api:latest"
     DOCKER_NETWORK   = "ecommerce-net"
@@ -40,11 +40,13 @@ pipeline {
       post {
         always {
           junit allowEmptyResults: true, testResults: 'backend/**/junit/*.xml'
-          publishHTML([
-            allowMissing: true,
+          publishHTML(target: [
             reportDir: 'backend/coverage/lcov-report',
             reportFiles: 'index.html',
-            reportName: 'Coverage'
+            reportName: 'Coverage',
+            allowMissing: true,
+            keepAll: true,
+            alwaysLinkToLastBuild: true
           ])
         }
       }
@@ -79,7 +81,6 @@ pipeline {
       steps {
         ansiColor('xterm') {
           script {
-            // Try to login to Docker Hub to avoid anonymous rate limits
             try {
               withCredentials([usernamePassword(credentialsId: 'dockerhub', usernameVariable: 'DOCKERHUB_USR', passwordVariable: 'DOCKERHUB_PSW')]) {
                 sh 'echo "$DOCKERHUB_PSW" | docker login -u "$DOCKERHUB_USR" --password-stdin'
@@ -117,7 +118,6 @@ pipeline {
           steps {
             ansiColor('xterm') {
               script {
-                // Ensure pulls (trivy image, base layers) won’t rate-limit
                 try {
                   withCredentials([usernamePassword(credentialsId: 'dockerhub', usernameVariable: 'DOCKERHUB_USR', passwordVariable: 'DOCKERHUB_PSW')]) {
                     sh 'echo "$DOCKERHUB_PSW" | docker login -u "$DOCKERHUB_USR" --password-stdin'
@@ -183,7 +183,7 @@ pipeline {
             docker rm -f "$MONGO_CONTAINER" >/dev/null 2>&1 || true
             docker run -d --name "$MONGO_CONTAINER" \
               --network "$DOCKER_NETWORK" -p 27017:27017 \
-              --health-cmd='\'mongosh --quiet --eval "db.adminCommand({ ping: 1 })" || exit 1\'' \
+              --health-cmd="mongosh --quiet --eval 'db.adminCommand({ ping: 1 })' || exit 1" \
               --health-interval=5s --health-timeout=3s --health-retries=30 \
               mongo
 
@@ -206,7 +206,7 @@ pipeline {
               -p ${APP_PORT_HOST}:${APP_PORT_CONTAINER} \
               ecommerce-api:latest
 
-            # Wait for app container to be healthy or respond on /health
+            # Wait for app to be ready
             echo "Waiting for app to be ready..."
             for i in $(seq 1 120); do
               status=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$STAGING_CONTAINER" || echo none)
@@ -217,7 +217,7 @@ pipeline {
               sleep 2
             done
             echo "App never became ready"
-            docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" || true
+            docker ps --format "table {{.Names}}\\t{{.Status}}\\t{{.Ports}}" || true
             docker logs --tail 200 "$STAGING_CONTAINER" || true
             exit 1
           '''
