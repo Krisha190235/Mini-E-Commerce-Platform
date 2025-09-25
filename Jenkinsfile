@@ -92,10 +92,9 @@ pipeline {
             script {
               def scannerHome = tool env.SONAR_SCANNER
               dir('backend') {
-                // Force Sonar to use Node 18 installed via Jenkins tool
                 def nodeBin = tool('node18') + '/bin/node'
                 sh """
-                  export PATH="$(tool('node18'))/bin:\$PATH"
+                  export PATH="${tool('node18')}/bin:\\$PATH"
                   "${scannerHome}/bin/sonar-scanner" \
                     -Dsonar.projectKey=ecommerce-backend \
                     -Dsonar.sources=. \
@@ -114,13 +113,11 @@ pipeline {
     stage('Quality Gate') {
       when {
         anyOf {
-          // Run the gate only on main branch (adjust as you wish)
           expression { return env.BRANCH_NAME == null || env.BRANCH_NAME == 'main' }
         }
       }
       steps {
         script {
-          // Do NOT abort the pipeline; mark UNSTABLE instead on failure
           def qg = waitForQualityGate(abortPipeline: false)
           echo "Quality Gate: ${qg.status}${qg.msg ? " - ${qg.msg}" : ""}"
           if (qg.status != 'OK') {
@@ -166,17 +163,15 @@ pipeline {
       }
     }
 
-    // 6) DEPLOY (staging on Docker; exposes http://localhost:8082 and http://localhost:8081)
+    // 6) DEPLOY
     stage('Deploy') {
       steps {
         ansiColor('xterm') {
           sh '''
             set -eux
 
-            # ensure network exists
             docker network inspect "${DOCKER_NETWORK}" >/dev/null 2>&1 || docker network create "${DOCKER_NETWORK}"
 
-            # (re)start Mongo with healthcheck
             docker rm -f "${MONGO_CONTAINER}" || true
             docker run -d --name "${MONGO_CONTAINER}" --network "${DOCKER_NETWORK}" -p 27017:27017 \
               --health-cmd='mongosh --quiet --eval "db.adminCommand({ ping: 1 }).ok"' \
@@ -195,7 +190,6 @@ pipeline {
               fi
             done
 
-            # (re)start backend
             docker rm -f "${STAGING_CONTAINER}" || true
             docker run -d --name "${STAGING_CONTAINER}" --network "${DOCKER_NETWORK}" \
               -e NODE_ENV=production -e JWT_SECRET=change-me \
@@ -217,7 +211,6 @@ pipeline {
               fi
             done
 
-            # (re)start frontend
             docker rm -f "${FRONTEND_NAME}" || true
             docker run -d --name "${FRONTEND_NAME}" --network "${DOCKER_NETWORK}" \
               -p ${FRONTEND_PORT_HOST}:80 "${FRONTEND_LATEST}"
@@ -241,7 +234,7 @@ pipeline {
       }
     }
 
-    // 7) RELEASE (tag images)
+    // 7) RELEASE
     stage('Release') {
       steps {
         sh '''
@@ -263,7 +256,6 @@ pipeline {
             echo "Monitoring: probing API & Web via host ports ..."
             ok=1
 
-            # API probe
             if curl -sf "http://host.docker.internal:${APP_PORT_HOST}/health" >/dev/null; then
               echo "✅ API OK (host.docker.internal:${APP_PORT_HOST})"
             else
@@ -276,7 +268,6 @@ pipeline {
               fi
             fi
 
-            # Web probe
             if curl -sf "http://host.docker.internal:${FRONTEND_PORT_HOST}/health" >/dev/null; then
               echo "✅ Web OK (host.docker.internal:${FRONTEND_PORT_HOST})"
             else
