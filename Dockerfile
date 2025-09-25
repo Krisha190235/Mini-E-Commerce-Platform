@@ -18,3 +18,6 @@ HEALTHCHECK --interval=15s --timeout=3s --retries=5 \
 
 # Start the API (NODE_ENV / MONGO_URL set at runtime)
 CMD ["node", "backend/src/app.js"]
+
+# at the end of Dockerfile
+HEALTHCHECK --interval=5s --timeout=3s --retries=30 CMD node -e "require('http').get('http://localhost:3000/health', r=>{process.exitCode = (r.statusCode===200)?0:1}).on('error',()=>process.exit(1))"

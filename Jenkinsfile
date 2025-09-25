@@ -151,34 +151,83 @@ pipeline {
     }
 
     stage('Deploy') {
-      steps {
-        sh '''
-          # Create network if missing
-          docker network inspect "${DOCKER_NETWORK}" >/dev/null 2>&1 || docker network create "${DOCKER_NETWORK}"
+  steps {
+    sh '''
+      set -eux
 
-          # Restart Mongo (idempotent)
-          docker rm -f "${MONGO_CONTAINER}" >/dev/null 2>&1 || true
-          docker run -d --name "${MONGO_CONTAINER}" --network "${DOCKER_NETWORK}" -p 27017:27017 mongo
+      DOCKER_NETWORK="ecommerce-net"
+      MONGO_CONTAINER="ecommerce-mongo"
+      STAGING_CONTAINER="ecommerce-staging"
+      APP_PORT_HOST=8082
+      APP_PORT_CONTAINER=3000
+      MONGO_DB_NAME=ecom
 
-          # Restart staging API with proper DB URL
-          docker rm -f "${STAGING_CONTAINER}" >/dev/null 2>&1 || true
-          docker run -d --name "${STAGING_CONTAINER}" \
-            --network "${DOCKER_NETWORK}" \
-            -e NODE_ENV=production \
-            -e JWT_SECRET=change-me \
-            -e MONGO_URL="mongodb://${MONGO_CONTAINER}:27017/ecom" \
-            -p 8082:3000 \
-            "${APP_IMAGE_LATEST}"
-        '''
-      }
-    }
+      # Ensure network
+      docker network inspect "$DOCKER_NETWORK" >/dev/null 2>&1 || docker network create "$DOCKER_NETWORK"
 
-    stage('Monitoring') {
-      steps {
-        sh 'curl -sf http://localhost:8082/health'
-        echo 'Staging health check passed.'
-      }
-    }
+      # (Re)start Mongo with a healthcheck
+      docker rm -f "$MONGO_CONTAINER" >/dev/null 2>&1 || true
+      docker run -d --name "$MONGO_CONTAINER" \
+        --network "$DOCKER_NETWORK" -p 27017:27017 \
+        --health-cmd='mongosh --quiet --eval "db.adminCommand({ ping: 1 })" || exit 1' \
+        --health-interval=5s --health-timeout=3s --health-retries=30 \
+        mongo
+
+      echo "Waiting for Mongo to be healthy..."
+      for i in $(seq 1 120); do
+        s=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$MONGO_CONTAINER" || echo none)
+        [ "$s" = healthy ] && break
+        sleep 1
+      done
+      s=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$MONGO_CONTAINER" || echo none)
+      [ "$s" = healthy ] || { echo "Mongo never became healthy"; docker logs "$MONGO_CONTAINER" || true; exit 1; }
+
+      # (Re)start app
+      docker rm -f "$STAGING_CONTAINER" >/dev/null 2>&1 || true
+      docker run -d --name "$STAGING_CONTAINER" \
+        --network "$DOCKER_NETWORK" \
+        -e NODE_ENV=production \
+        -e JWT_SECRET=change-me \
+        -e MONGO_URL="mongodb://$MONGO_CONTAINER:27017/$MONGO_DB_NAME" \
+        -p ${APP_PORT_HOST}:${APP_PORT_CONTAINER} \
+        ecommerce-api:latest
+
+      # Wait for app container to be healthy or respond on /health
+      echo "Waiting for app to be ready..."
+      for i in $(seq 1 120); do
+        status=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$STAGING_CONTAINER" || echo none)
+        if [ "$status" = healthy ] || curl -sf "http://localhost:${APP_PORT_HOST}/health" >/dev/null 2>&1; then
+          echo "App is ready."
+          exit 0
+        fi
+        sleep 2
+      done
+      echo "App never became ready"
+      docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" || true
+      docker logs --tail 200 "$STAGING_CONTAINER" || true
+      exit 1
+    '''
+  }
+}
+
+stage('Monitoring') {
+  steps {
+    sh '''
+      set -e
+      for i in $(seq 1 30); do
+        if curl -sf http://localhost:8082/health >/dev/null; then
+          echo "Staging health check passed."
+          exit 0
+        fi
+        echo "Retry $i: app not ready yet..."
+        docker logs --tail 50 ecommerce-staging || true
+        sleep 2
+      done
+      echo "Health check failed after retries"
+      exit 7
+    '''
+  }
+}
 
     stage('Release') {
       steps {
