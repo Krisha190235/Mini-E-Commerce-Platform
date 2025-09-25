@@ -54,21 +54,24 @@ pipeline {
     }
 
     stage('Code Quality') {
-      steps {
-        ansiColor('xterm') {
-          withSonarQubeEnv('SonarQube') {
-            dir('backend') {
-              sh '''
-                npx sonar-scanner \
-                  -Dsonar.projectKey=ecommerce-backend \
-                  -Dsonar.sources=. \
-                  -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
-              '''
-            }
-          }
+  steps {
+    ansiColor('xterm') {
+      withSonarQubeEnv('SonarQube') {
+        // Use the preinstalled scanner tool, not npx
+        def scannerHome = tool 'sonar-scanner-4.8'
+        dir('backend') {
+          sh """
+            "${scannerHome}/bin/sonar-scanner" \
+              -Dsonar.projectKey=ecommerce-backend \
+              -Dsonar.sources=src \
+              -Dsonar.exclusions=tests/**,**/*.test.js,**/node_modules/**,**/dist/** \
+              -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
+          """
         }
       }
     }
+  }
+}
 
     stage('Quality Gate') {
       steps {
