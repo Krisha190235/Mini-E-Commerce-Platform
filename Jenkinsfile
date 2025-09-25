@@ -5,10 +5,8 @@ pipeline {
 
   environment {
     // SonarQube
-    // If Jenkins “SonarQube servers” is configured, withSonarQubeEnv will inject SONAR_HOST_URL.
-    // This default is used only if that isn’t set by Jenkins.
-    SONAR_HOST_URL   = 'http://host.docker.internal:9000'
-    SONAR_SCANNER    = 'sonar-scanner-4.8'
+    SONAR_HOST_URL   = 'http://sonarqube:9000'     // service name resolvable from Jenkins container
+    SONAR_SCANNER    = 'sonar-scanner-4.8'         // Jenkins Global Tool name
 
     // Backend image naming & tagging
     APP_NAME         = 'ecommerce-api'
@@ -17,12 +15,12 @@ pipeline {
     APP_IMAGE_LATEST = "${APP_NAME}:latest"
 
     // Runtime (staging) setup
-    DOCKER_NETWORK   = 'ecommerce-net'
-    MONGO_CONTAINER  = 'ecommerce-mongo'
-    STAGING_CONTAINER= 'ecommerce-staging'
-    APP_PORT_HOST    = '8082'
-    APP_PORT_CONT    = '3000'
-    MONGO_DB_NAME    = 'ecom'
+    DOCKER_NETWORK    = 'ecommerce-net'
+    MONGO_CONTAINER   = 'ecommerce-mongo'
+    STAGING_CONTAINER = 'ecommerce-staging'
+    APP_PORT_HOST     = '8082'
+    APP_PORT_CONT     = '3000'
+    MONGO_DB_NAME     = 'ecom'
 
     // Frontend
     FRONTEND_NAME      = 'ecommerce-web'
@@ -33,6 +31,7 @@ pipeline {
 
   stages {
 
+    // 1) BUILD
     stage('Build') {
       steps {
         ansiColor('xterm') {
@@ -63,6 +62,7 @@ pipeline {
       }
     }
 
+    // 2) TEST
     stage('Test') {
       steps {
         ansiColor('xterm') {
@@ -84,30 +84,33 @@ pipeline {
       }
     }
 
-    // ====== UPDATED ======
+    // 3) CODE QUALITY (SonarQube)
     stage('Code Quality') {
       steps {
         ansiColor('xterm') {
-          // Inject SONAR_HOST_URL (if configured in Jenkins global config)
           withSonarQubeEnv('SonarQube') {
-            // Load your Secret Text credential: ID = sonarqube-token1
+            // Pull token from Jenkins credentials safely
             withCredentials([string(credentialsId: 'sonarqube-token1', variable: 'SONAR_TOKEN')]) {
-              script {
-                def scannerHome = tool env.SONAR_SCANNER
-                def nodeBin     = tool('node18') + '/bin/node'
-                dir('backend') {
-                  sh """
-                    set -eux
-                    export PATH="${tool('node18')}/bin:\\$PATH"
-                    "${scannerHome}/bin/sonar-scanner" \
-                      -Dsonar.host.url="${SONAR_HOST_URL}" \
-                      -Dsonar.login="${SONAR_TOKEN}" \
-                      -Dsonar.projectKey=ecommerce-backend \
-                      -Dsonar.sources=. \
-                      -Dsonar.exclusions=tests/**,**/*.test.js,**/node_modules/**,**/dist/** \
-                      -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info \
-                      -Dsonar.nodejs.executable=${nodeBin}
-                  """
+              // expose token only as env var so sonar-scanner can auto-detect it; don't interpolate in Groovy
+              withEnv(["SONAR_TOKEN=${SONAR_TOKEN}"]) {
+                script {
+                  def scannerHome = tool env.SONAR_SCANNER
+                  def nodeHome    = tool('node18')
+                  def nodeBin     = "${nodeHome}/bin/node"
+
+                  dir('backend') {
+                    sh """
+                      set -eux
+                      export PATH="${nodeHome}/bin:\\$PATH"
+                      "${scannerHome}/bin/sonar-scanner" \
+                        -Dsonar.host.url=${SONAR_HOST_URL} \
+                        -Dsonar.projectKey=ecommerce-backend \
+                        -Dsonar.sources=. \
+                        -Dsonar.exclusions=tests/**,**/*.test.js,**/node_modules/**,**/dist/** \
+                        -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info \
+                        -Dsonar.nodejs.executable=${nodeBin}
+                    """
+                  }
                 }
               }
             }
@@ -115,8 +118,8 @@ pipeline {
         }
       }
     }
-    // ====== /UPDATED ======
 
+    // 4) QUALITY GATE (non-fatal, main only)
     stage('Quality Gate') {
       when {
         anyOf {
@@ -125,15 +128,22 @@ pipeline {
       }
       steps {
         script {
-          def qg = waitForQualityGate(abortPipeline: false)
-          echo "Quality Gate: ${qg.status}${qg.msg ? " - ${qg.msg}" : ""}"
-          if (qg.status != 'OK') {
+          try {
+            // Don’t abort the whole pipeline if Sonar is temporarily unreachable
+            def qg = waitForQualityGate(abortPipeline: false)
+            echo "Quality Gate: ${qg.status}${qg.msg ? " - ${qg.msg}" : ""}"
+            if (qg.status != 'OK') {
+              currentBuild.result = 'UNSTABLE'
+            }
+          } catch (Throwable t) {
+            echo "Quality Gate check failed to run: ${t.message}"
             currentBuild.result = 'UNSTABLE'
           }
         }
       }
     }
 
+    // 5) SECURITY (non-blocking by design here)
     stage('Security') {
       parallel {
         stage('Snyk (deps)') {
@@ -169,6 +179,7 @@ pipeline {
       }
     }
 
+    // 6) DEPLOY (local staging with Mongo)
     stage('Deploy') {
       steps {
         ansiColor('xterm') {
@@ -239,6 +250,7 @@ pipeline {
       }
     }
 
+    // 7) RELEASE (local tags)
     stage('Release') {
       steps {
         sh '''
@@ -251,6 +263,7 @@ pipeline {
       }
     }
 
+    // 8) MONITORING (non-fatal)
     stage('Monitoring') {
       steps {
         ansiColor('xterm') {
@@ -269,7 +282,7 @@ pipeline {
               else
                 echo "⚠️  API still not reachable"; ok=0
               fi
-            fi`
+            fi
 
             if curl -sf "http://host.docker.internal:${FRONTEND_PORT_HOST}/health" >/dev/null; then
               echo "✅ Web OK (host.docker.internal:${FRONTEND_PORT_HOST})"
