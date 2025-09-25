@@ -5,8 +5,8 @@ pipeline {
 
   environment {
     // SonarQube
-    SONAR_HOST_URL   = 'http://sonarqube:9000'     // service name resolvable from Jenkins container
-    SONAR_SCANNER    = 'sonar-scanner-4.8'         // Jenkins Global Tool name
+    SONAR_HOST_URL   = 'http://host.docker.internal:9000'   // change to your reachable URL if different
+    SONAR_SCANNER    = 'sonar-scanner-4.8'                  // Global tool name
 
     // Backend image naming & tagging
     APP_NAME         = 'ecommerce-api'
@@ -89,28 +89,28 @@ pipeline {
       steps {
         ansiColor('xterm') {
           withSonarQubeEnv('SonarQube') {
-            // Pull token from Jenkins credentials safely
+            // Use your secret text credential that stores the SonarQube user token
             withCredentials([string(credentialsId: 'sonarqube-token1', variable: 'SONAR_TOKEN')]) {
-              // expose token only as env var so sonar-scanner can auto-detect it; don't interpolate in Groovy
-              withEnv(["SONAR_TOKEN=${SONAR_TOKEN}"]) {
-                script {
-                  def scannerHome = tool env.SONAR_SCANNER
-                  def nodeHome    = tool('node18')
-                  def nodeBin     = "${nodeHome}/bin/node"
+              script {
+                def scannerHome = tool env.SONAR_SCANNER
+                def nodeHome    = tool('node18')
+                def nodeBin     = "${nodeHome}/bin/node"
 
-                  dir('backend') {
-                    sh """
-                      set -eux
-                      export PATH="${nodeHome}/bin:\\$PATH"
-                      "${scannerHome}/bin/sonar-scanner" \
-                        -Dsonar.host.url=${SONAR_HOST_URL} \
-                        -Dsonar.projectKey=ecommerce-backend \
-                        -Dsonar.sources=. \
-                        -Dsonar.exclusions=tests/**,**/*.test.js,**/node_modules/**,**/dist/** \
-                        -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info \
-                        -Dsonar.nodejs.executable=${nodeBin}
-                    """
-                  }
+                dir('backend') {
+                  // No Groovy interpolation of the secret; it's passed via environment at runtime.
+                  sh """
+                    set -eux
+                    export PATH="${nodeHome}/bin:\\$PATH"
+
+                    SONAR_TOKEN="\\$SONAR_TOKEN" \\
+                    "${scannerHome}/bin/sonar-scanner" \\
+                      -Dsonar.host.url=${SONAR_HOST_URL} \\
+                      -Dsonar.projectKey=ecommerce-backend \\
+                      -Dsonar.sources=. \\
+                      -Dsonar.exclusions=tests/**,**/*.test.js,**/node_modules/**,**/dist/** \\
+                      -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info \\
+                      -Dsonar.nodejs.executable=${nodeBin}
+                  """
                 }
               }
             }
@@ -119,7 +119,7 @@ pipeline {
       }
     }
 
-    // 4) QUALITY GATE (non-fatal, main only)
+    // 4) QUALITY GATE (non-blocking + only on main)
     stage('Quality Gate') {
       when {
         anyOf {
@@ -128,22 +128,16 @@ pipeline {
       }
       steps {
         script {
-          try {
-            // Don’t abort the whole pipeline if Sonar is temporarily unreachable
-            def qg = waitForQualityGate(abortPipeline: false)
-            echo "Quality Gate: ${qg.status}${qg.msg ? " - ${qg.msg}" : ""}"
-            if (qg.status != 'OK') {
-              currentBuild.result = 'UNSTABLE'
-            }
-          } catch (Throwable t) {
-            echo "Quality Gate check failed to run: ${t.message}"
+          def qg = waitForQualityGate(abortPipeline: false)
+          echo "Quality Gate: ${qg.status}${qg.msg ? " - ${qg.msg}" : ""}"
+          if (qg.status != 'OK') {
             currentBuild.result = 'UNSTABLE'
           }
         }
       }
     }
 
-    // 5) SECURITY (non-blocking by design here)
+    // 5) SECURITY
     stage('Security') {
       parallel {
         stage('Snyk (deps)') {
@@ -179,7 +173,7 @@ pipeline {
       }
     }
 
-    // 6) DEPLOY (local staging with Mongo)
+    // 6) DEPLOY (local staging)
     stage('Deploy') {
       steps {
         ansiColor('xterm') {
@@ -250,7 +244,7 @@ pipeline {
       }
     }
 
-    // 7) RELEASE (local tags)
+    // 7) RELEASE
     stage('Release') {
       steps {
         sh '''
