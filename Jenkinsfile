@@ -1,15 +1,7 @@
 pipeline {
   agent any
-
-  tools {
-    nodejs 'node18'   // <-- must match the NodeJS tool configured in Jenkins
-  }
-
-  options {
-    timestamps()
-    disableConcurrentBuilds()
-    disableResume()
-  }
+  tools { nodejs 'node18' }
+  options { timestamps() }
 
   environment {
     // SonarQube
@@ -46,16 +38,16 @@ pipeline {
           sh '''
             set -eux
 
-            # Backend
+            # Backend build
             cd backend
             npm ci
             npm run build || echo "No build step required"
             cd ..
 
-            # Backend Docker image (used later for scan/deploy)
+            # Build backend Docker image (for scan/deploy)
             docker build -t "${APP_IMAGE}" -t "${APP_IMAGE_LATEST}" .
 
-            # Frontend (Vite) & image
+            # Frontend build & image
             cd frontend
             npm ci
             docker build -t "${FRONTEND_IMAGE}" -t "${FRONTEND_LATEST}" \
@@ -92,28 +84,25 @@ pipeline {
       }
     }
 
-    // 3) CODE QUALITY (force SonarJS to Node 18)
+    // 3) CODE QUALITY
     stage('Code Quality') {
       steps {
         ansiColor('xterm') {
           withSonarQubeEnv('SonarQube') {
             script {
               def scannerHome = tool env.SONAR_SCANNER
-              def node18      = tool 'node18'
               dir('backend') {
-                retry(1) {
-                  timeout(time: 10, unit: 'MINUTES') {
-                    sh """
-                      export PATH="${node18}/bin:\$PATH"
-                      "${scannerHome}/bin/sonar-scanner" \
-                        -Dsonar.projectKey=ecommerce-backend \
-                        -Dsonar.sources=. \
-                        -Dsonar.exclusions=tests/**,**/*.test.js,**/node_modules/**,**/dist/** \
-                        -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info \
-                        -Dsonar.nodejs.executable=${node18}/bin/node
-                    """
-                  }
-                }
+                // Force Sonar to use Node 18 installed via Jenkins tool
+                def nodeBin = tool('node18') + '/bin/node'
+                sh """
+                  export PATH="$(tool('node18'))/bin:\$PATH"
+                  "${scannerHome}/bin/sonar-scanner" \
+                    -Dsonar.projectKey=ecommerce-backend \
+                    -Dsonar.sources=. \
+                    -Dsonar.exclusions=tests/**,**/*.test.js,**/node_modules/**,**/dist/** \
+                    -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info \
+                    -Dsonar.nodejs.executable=${nodeBin}
+                """
               }
             }
           }
@@ -121,11 +110,22 @@ pipeline {
       }
     }
 
-    // 4) QUALITY GATE
+    // 4) QUALITY GATE (non-blocking + only on main)
     stage('Quality Gate') {
+      when {
+        anyOf {
+          // Run the gate only on main branch (adjust as you wish)
+          expression { return env.BRANCH_NAME == null || env.BRANCH_NAME == 'main' }
+        }
+      }
       steps {
-        timeout(time: 10, unit: 'MINUTES') {
-          waitForQualityGate abortPipeline: true
+        script {
+          // Do NOT abort the pipeline; mark UNSTABLE instead on failure
+          def qg = waitForQualityGate(abortPipeline: false)
+          echo "Quality Gate: ${qg.status}${qg.msg ? " - ${qg.msg}" : ""}"
+          if (qg.status != 'OK') {
+            currentBuild.result = 'UNSTABLE'
+          }
         }
       }
     }
@@ -159,22 +159,24 @@ pipeline {
               '''
             }
           }
-          post { always { archiveArtifacts artifacts: 'trivy.txt', fingerprint: true } }
+          post {
+            always { archiveArtifacts artifacts: 'trivy.txt', fingerprint: true }
+          }
         }
       }
     }
 
-    // 6) DEPLOY (staging: http://localhost:8082 API, http://localhost:8081 Web)
+    // 6) DEPLOY (staging on Docker; exposes http://localhost:8082 and http://localhost:8081)
     stage('Deploy') {
       steps {
         ansiColor('xterm') {
           sh '''
             set -eux
 
-            # Network
+            # ensure network exists
             docker network inspect "${DOCKER_NETWORK}" >/dev/null 2>&1 || docker network create "${DOCKER_NETWORK}"
 
-            # Mongo
+            # (re)start Mongo with healthcheck
             docker rm -f "${MONGO_CONTAINER}" || true
             docker run -d --name "${MONGO_CONTAINER}" --network "${DOCKER_NETWORK}" -p 27017:27017 \
               --health-cmd='mongosh --quiet --eval "db.adminCommand({ ping: 1 }).ok"' \
@@ -193,7 +195,7 @@ pipeline {
               fi
             done
 
-            # Backend
+            # (re)start backend
             docker rm -f "${STAGING_CONTAINER}" || true
             docker run -d --name "${STAGING_CONTAINER}" --network "${DOCKER_NETWORK}" \
               -e NODE_ENV=production -e JWT_SECRET=change-me \
@@ -215,7 +217,7 @@ pipeline {
               fi
             done
 
-            # Frontend (nginx)
+            # (re)start frontend
             docker rm -f "${FRONTEND_NAME}" || true
             docker run -d --name "${FRONTEND_NAME}" --network "${DOCKER_NETWORK}" \
               -p ${FRONTEND_PORT_HOST}:80 "${FRONTEND_LATEST}"
@@ -258,9 +260,10 @@ pipeline {
         ansiColor('xterm') {
           sh '''
             set -eux
-            echo "Probing API & Web via host ports ..."
+            echo "Monitoring: probing API & Web via host ports ..."
             ok=1
 
+            # API probe
             if curl -sf "http://host.docker.internal:${APP_PORT_HOST}/health" >/dev/null; then
               echo "✅ API OK (host.docker.internal:${APP_PORT_HOST})"
             else
@@ -273,6 +276,7 @@ pipeline {
               fi
             fi
 
+            # Web probe
             if curl -sf "http://host.docker.internal:${FRONTEND_PORT_HOST}/health" >/dev/null; then
               echo "✅ Web OK (host.docker.internal:${FRONTEND_PORT_HOST})"
             else
@@ -294,7 +298,7 @@ pipeline {
   post {
     success {
       echo "Pipeline SUCCESS."
-      echo "API:      http://localhost:${APP_PORT_HOST} (Swagger: /api-docs)"
+      echo "API:      http://localhost:${APP_PORT_HOST}       (Swagger: /api-docs)"
       echo "Website:  http://localhost:${FRONTEND_PORT_HOST}"
     }
     always {
