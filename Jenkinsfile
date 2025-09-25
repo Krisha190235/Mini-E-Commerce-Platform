@@ -4,9 +4,18 @@ pipeline {
 
   environment {
     SONAR_HOST_URL = 'http://host.docker.internal:9000'
+    DOCKER_IMAGE   = "ecommerce-api:${BUILD_NUMBER}"
+    DOCKER_IMAGE_LATEST = "ecommerce-api:latest"
+    DOCKER_NET     = "ecommerce-net"
+    MONGO_CONT     = "ecommerce-mongo"
+    APP_CONT       = "ecommerce-staging"
+    APP_PORT_HOST  = "8082"
+    APP_PORT_CONT  = "3000"
+    MONGO_URL      = "mongodb://ecommerce-mongo:27017/ecom"
   }
 
   stages {
+
     stage('Checkout') {
       steps { checkout scm }
     }
@@ -43,7 +52,6 @@ pipeline {
 
     stage('Code Quality') {
       steps {
-        // Use the Jenkins SonarQube server named "SonarQube"
         withSonarQubeEnv('SonarQube') {
           dir('backend') {
             sh '''
@@ -57,11 +65,33 @@ pipeline {
       }
     }
 
-    // Wait for Sonar to compute the Quality Gate; fail the build if red
     stage('Quality Gate') {
       steps {
         timeout(time: 5, unit: 'MINUTES') {
           waitForQualityGate abortPipeline: true
+        }
+      }
+    }
+
+    // Build image once (logged-in) so later stages don't hit Docker Hub rate limits
+    stage('Docker Build') {
+      steps {
+        script {
+          try {
+            withCredentials([usernamePassword(credentialsId: 'dockerhub',
+                      usernameVariable: 'DOCKERHUB_USR',
+                      passwordVariable: 'DOCKERHUB_PSW')]) {
+              sh '''
+                echo "$DOCKERHUB_PSW" | docker login -u "$DOCKERHUB_USR" --password-stdin
+                docker build -t "$DOCKER_IMAGE" -t "$DOCKER_IMAGE_LATEST" .
+                docker logout || true
+              '''
+            }
+          } catch (err) {
+            // If dockerhub creds are not configured, still attempt an anonymous build (may hit rate limits)
+            echo 'DockerHub credentials not configured. Attempting anonymous build...'
+            sh 'docker build -t "$DOCKER_IMAGE" -t "$DOCKER_IMAGE_LATEST" .'
+          }
         }
       }
     }
@@ -80,33 +110,37 @@ pipeline {
             }
           }
         }
+
         stage('Trivy Image Scan') {
           steps {
             sh '''
-              docker build -t ecommerce-api:${BUILD_NUMBER} .
               docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
                 aquasec/trivy:latest image \
                 --exit-code 1 --severity CRITICAL \
-                ecommerce-api:${BUILD_NUMBER} | tee trivy.txt
+                "$DOCKER_IMAGE" | tee trivy.txt || true
             '''
           }
-          post { always { archiveArtifacts artifacts: 'trivy.txt', fingerprint: true } }
+          post {
+            always { archiveArtifacts artifacts: 'trivy.txt', fingerprint: true }
+          }
         }
       }
     }
 
-    stage('Docker Build & Push') {
+    stage('Docker Push (optional)') {
       steps {
         script {
-          sh 'docker build -t ecommerce-api:latest .'
           try {
-            withCredentials([usernamePassword(credentialsId: 'dockerhub', usernameVariable: 'DOCKERHUB_USR', passwordVariable: 'DOCKERHUB_PSW')]) {
+            withCredentials([usernamePassword(credentialsId: 'dockerhub',
+                      usernameVariable: 'DOCKERHUB_USR',
+                      passwordVariable: 'DOCKERHUB_PSW')]) {
               sh '''
                 echo "$DOCKERHUB_PSW" | docker login -u "$DOCKERHUB_USR" --password-stdin
-                docker tag ecommerce-api:latest ${DOCKERHUB_USR}/ecommerce-api:${BUILD_NUMBER}
-                docker tag ecommerce-api:latest ${DOCKERHUB_USR}/ecommerce-api:latest
+                docker tag "$DOCKER_IMAGE_LATEST" ${DOCKERHUB_USR}/ecommerce-api:${BUILD_NUMBER}
+                docker tag "$DOCKER_IMAGE_LATEST" ${DOCKERHUB_USR}/ecommerce-api:latest
                 docker push ${DOCKERHUB_USR}/ecommerce-api:${BUILD_NUMBER}
                 docker push ${DOCKERHUB_USR}/ecommerce-api:latest
+                docker logout || true
               '''
             }
           } catch (err) {
@@ -118,36 +152,30 @@ pipeline {
 
     stage('Deploy') {
       steps {
-        // Ensure network + DB exist, then run API wired to Mongo via MONGO_URL
         sh '''
-          docker network create ecommerce-net || true
+          # network (idempotent)
+          docker network create "$DOCKER_NET" || true
 
-          # Mongo (idempotent)
-          if ! docker ps --format '{{.Names}}' | grep -q '^ecommerce-mongo$'; then
-            docker rm -f ecommerce-mongo >/dev/null 2>&1 || true
-            docker run -d --name ecommerce-mongo \
-              --network ecommerce-net \
-              -p 27017:27017 \
-              mongo
-          fi
+          # db (idempotent)
+          docker rm -f "$MONGO_CONT" 2>/dev/null || true
+          docker run -d --name "$MONGO_CONT" --network "$DOCKER_NET" -p 27017:27017 mongo
 
-          # API (recreate)
-          docker rm -f ecommerce-staging || true
-          docker run -d --name ecommerce-staging \
-            --network ecommerce-net \
+          # app
+          docker rm -f "$APP_CONT" 2>/dev/null || true
+          docker run -d --name "$APP_CONT" \
+            --network "$DOCKER_NET" \
             -e NODE_ENV=production \
             -e JWT_SECRET=change-me \
-            -e MONGO_URL="mongodb://ecommerce-mongo:27017/ecom" \
-            -p 8082:3000 \
-            ecommerce-api:latest
+            -e MONGO_URL="$MONGO_URL" \
+            -p ${APP_PORT_HOST}:${APP_PORT_CONT} \
+            "$DOCKER_IMAGE_LATEST"
         '''
       }
     }
 
     stage('Monitoring') {
       steps {
-        // Jenkins is in a container; hit the host via special DNS
-        sh 'curl -sf http://host.docker.internal:8082/health'
+        sh 'curl -sf http://localhost:${APP_PORT_HOST}/health'
         echo 'Staging health check passed.'
       }
     }
@@ -160,5 +188,7 @@ pipeline {
     }
   }
 
-  post { always { cleanWs() } }
+  post {
+    always { cleanWs() }
+  }
 }
