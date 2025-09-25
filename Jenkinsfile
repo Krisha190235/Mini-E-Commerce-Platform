@@ -54,24 +54,26 @@ pipeline {
     }
 
     stage('Code Quality') {
-  steps {
-    ansiColor('xterm') {
-      withSonarQubeEnv('SonarQube') {
-        // Use the preinstalled scanner tool, not npx
-        def scannerHome = tool 'sonar-scanner-4.8'
-        dir('backend') {
-          sh """
-            "${scannerHome}/bin/sonar-scanner" \
-              -Dsonar.projectKey=ecommerce-backend \
-              -Dsonar.sources=src \
-              -Dsonar.exclusions=tests/**,**/*.test.js,**/node_modules/**,**/dist/** \
-              -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
-          """
+      steps {
+        ansiColor('xterm') {
+          withSonarQubeEnv('SonarQube') {
+            script {
+              // Use the SonarScanner tool configured in Manage Jenkins » Tools
+              def scannerHome = tool 'sonar-scanner-4.8'
+              dir('backend') {
+                sh """
+                  "${scannerHome}/bin/sonar-scanner" \
+                    -Dsonar.projectKey=ecommerce-backend \
+                    -Dsonar.sources=. \
+                    -Dsonar.exclusions=tests/**,**/*.test.js,**/node_modules/**,**/dist/** \
+                    -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
+                """
+              }
+            }
+          }
         }
       }
     }
-  }
-}
 
     stage('Quality Gate') {
       steps {
@@ -92,10 +94,7 @@ pipeline {
             } catch (e) {
               echo 'DockerHub credentials not configured. Building anonymously (may hit rate limits).'
             }
-
-            sh '''
-              docker build -t "${APP_IMAGE}" -t "${APP_IMAGE_LATEST}" .
-            '''
+            sh 'docker build -t "${APP_IMAGE}" -t "${APP_IMAGE_LATEST}" .'
           }
         }
       }
@@ -117,7 +116,6 @@ pipeline {
             }
           }
         }
-
         stage('Trivy Image Scan') {
           steps {
             ansiColor('xterm') {
@@ -129,7 +127,6 @@ pipeline {
                 } catch (e) {
                   echo 'DockerHub credentials not configured for Trivy; scanning anonymously.'
                 }
-
                 sh '''
                   docker run --rm \
                     -v /var/run/docker.sock:/var/run/docker.sock \
@@ -172,7 +169,6 @@ pipeline {
         ansiColor('xterm') {
           sh '''
             set -eux
-
             DOCKER_NETWORK="ecommerce-net"
             MONGO_CONTAINER="ecommerce-mongo"
             STAGING_CONTAINER="ecommerce-staging"
@@ -180,10 +176,8 @@ pipeline {
             APP_PORT_CONTAINER=3000
             MONGO_DB_NAME=ecom
 
-            # Ensure network
             docker network inspect "$DOCKER_NETWORK" >/dev/null 2>&1 || docker network create "$DOCKER_NETWORK"
 
-            # (Re)start Mongo with a healthcheck
             docker rm -f "$MONGO_CONTAINER" >/dev/null 2>&1 || true
             docker run -d --name "$MONGO_CONTAINER" \
               --network "$DOCKER_NETWORK" -p 27017:27017 \
@@ -200,7 +194,6 @@ pipeline {
             s=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$MONGO_CONTAINER" || echo none)
             [ "$s" = healthy ] || { echo "Mongo never became healthy"; docker logs "$MONGO_CONTAINER" || true; exit 1; }
 
-            # (Re)start app
             docker rm -f "$STAGING_CONTAINER" >/dev/null 2>&1 || true
             docker run -d --name "$STAGING_CONTAINER" \
               --network "$DOCKER_NETWORK" \
@@ -210,7 +203,6 @@ pipeline {
               -p ${APP_PORT_HOST}:${APP_PORT_CONTAINER} \
               ecommerce-api:latest
 
-            # Wait for app to be ready
             echo "Waiting for app to be ready..."
             for i in $(seq 1 120); do
               status=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$STAGING_CONTAINER" || echo none)
