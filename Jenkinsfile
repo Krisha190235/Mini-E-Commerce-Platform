@@ -1,5 +1,6 @@
 pipeline {
   agent any
+  tools { nodejs 'node20' }
   options { timestamps() } // ansiColor must be used inside steps
 
   environment {
