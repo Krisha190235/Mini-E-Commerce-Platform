@@ -138,57 +138,52 @@ pipeline {
 
     // 5) DEPLOY (staging on Docker; exposes http://localhost:8082)
     stage('Deploy') {
-      steps {
-        ansiColor('xterm') {
-          sh '''
-            set -eux
+  steps {
+    ansiColor('xterm') {
+      sh '''
+        set -eux
 
-            # Ensure network
-            docker network inspect "$DOCKER_NETWORK" >/dev/null 2>&1 || docker network create "$DOCKER_NETWORK"
+        # ensure network exists (no-op if it does)
+        docker network inspect ecommerce-net >/dev/null 2>&1 || docker network create ecommerce-net
 
-            # (Re)start Mongo with healthcheck
-            docker rm -f "$MONGO_CONTAINER" >/dev/null 2>&1 || true
-            docker run -d --name "$MONGO_CONTAINER" \
-              --network "$DOCKER_NETWORK" -p 27017:27017 \
-              --health-cmd="mongosh --quiet --eval 'db.adminCommand({ ping: 1 })' || exit 1" \
-              --health-interval=5s --health-timeout=3s --health-retries=30 \
-              mongo
+        # (re)start Mongo with proper healthcheck
+        docker rm -f ecommerce-mongo || true
+        docker run -d --name ecommerce-mongo --network ecommerce-net -p 27017:27017 \
+          --health-cmd='mongosh --quiet --eval "db.adminCommand({ ping: 1 }).ok"' \
+          --health-interval=5s --health-timeout=3s --health-retries=30 mongo
 
-            echo "Waiting for Mongo to be healthy..."
-            for i in $(seq 1 120); do
-              s=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$MONGO_CONTAINER" || echo none)
-              [ "$s" = healthy ] && break
-              sleep 1
-            done
-            s=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$MONGO_CONTAINER" || echo none)
-            [ "$s" = healthy ] || { echo "Mongo never became healthy"; docker logs "$MONGO_CONTAINER" || true; exit 1; }
+        echo "Waiting for Mongo to be healthy..."
+        for i in $(seq 1 120); do
+          s=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' ecommerce-mongo)
+          [ "$s" = "healthy" ] && break
+          sleep 1
+        done
 
-            # (Re)start app container
-            docker rm -f "$STAGING_CONTAINER" >/dev/null 2>&1 || true
-            docker run -d --name "$STAGING_CONTAINER" \
-              --network "$DOCKER_NETWORK" \
-              -e NODE_ENV=production \
-              -e JWT_SECRET=change-me \
-              -e MONGO_URL="mongodb://$MONGO_CONTAINER:27017/$MONGO_DB_NAME" \
-              -p ${APP_PORT_HOST}:${APP_PORT_CONT} \
-              "${APP_IMAGE_LATEST}"
+        # (re)start app
+        docker rm -f ecommerce-staging || true
+        docker run -d --name ecommerce-staging --network ecommerce-net \
+          -e NODE_ENV=production -e JWT_SECRET=change-me \
+          -e MONGO_URL=mongodb://ecommerce-mongo:27017/ecom \
+          -p 8082:3000 ecommerce-api:latest
 
-            echo "Waiting for app to be ready on http://localhost:${APP_PORT_HOST}/health ..."
-            for i in $(seq 1 120); do
-              if curl -sf "http://localhost:${APP_PORT_HOST}/health" >/dev/null; then
-                echo "App is ready: http://localhost:${APP_PORT_HOST}"
-                exit 0
-              fi
-              sleep 2
-            done
-            echo "App failed to become ready"
-            docker ps --format "table {{.Names}}\\t{{.Status}}\\t{{.Ports}}" || true
-            docker logs --tail 200 "$STAGING_CONTAINER" || true
+        echo "Waiting for app to be ready on http://host.docker.internal:8082/health ..."
+        for i in $(seq 1 120); do
+          if curl -sf http://host.docker.internal:8082/health >/dev/null; then
+            echo "App is healthy ✅"
+            break
+          fi
+          sleep 2
+          if [ "$i" -eq 120 ]; then
+            echo "App failed to become ready" >&2
+            docker ps --format 'table {{.Names}}\\t{{.Status}}\\t{{.Ports}}'
+            docker logs --tail 200 ecommerce-staging || true
             exit 1
-          '''
-        }
-      }
+          fi
+        done
+      '''
     }
+  }
+}
 
     // 6) RELEASE (lightweight, tag image; push is optional)
     stage('Release') {
