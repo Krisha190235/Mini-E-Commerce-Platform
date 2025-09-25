@@ -12,5 +12,9 @@ COPY backend ./backend
 ENV PORT=3000
 EXPOSE 3000
 
-# Start the API (NODE_ENV can be overridden in deployment)
+# Add a simple healthcheck for faster Monitoring feedback
+HEALTHCHECK --interval=15s --timeout=3s --retries=5 \
+  CMD wget -qO- http://localhost:3000/health || exit 1
+
+# Start the API (NODE_ENV / MONGO_URL set at runtime)
 CMD ["node", "backend/src/app.js"]

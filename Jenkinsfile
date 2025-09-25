@@ -57,7 +57,7 @@ pipeline {
       }
     }
 
-    // 👉 NEW: block until SonarQube computes the gate, fail build if red
+    // Wait for Sonar to compute the Quality Gate; fail the build if red
     stage('Quality Gate') {
       steps {
         timeout(time: 5, unit: 'MINUTES') {
@@ -118,11 +118,26 @@ pipeline {
 
     stage('Deploy') {
       steps {
+        // Ensure network + DB exist, then run API wired to Mongo via MONGO_URL
         sh '''
+          docker network create ecommerce-net || true
+
+          # Mongo (idempotent)
+          if ! docker ps --format '{{.Names}}' | grep -q '^ecommerce-mongo$'; then
+            docker rm -f ecommerce-mongo >/dev/null 2>&1 || true
+            docker run -d --name ecommerce-mongo \
+              --network ecommerce-net \
+              -p 27017:27017 \
+              mongo
+          fi
+
+          # API (recreate)
           docker rm -f ecommerce-staging || true
           docker run -d --name ecommerce-staging \
+            --network ecommerce-net \
             -e NODE_ENV=production \
             -e JWT_SECRET=change-me \
+            -e MONGO_URL="mongodb://ecommerce-mongo:27017/ecom" \
             -p 8082:3000 \
             ecommerce-api:latest
         '''
@@ -131,7 +146,8 @@ pipeline {
 
     stage('Monitoring') {
       steps {
-        sh 'curl -sf http://localhost:8082/health'
+        // Jenkins is in a container; hit the host via special DNS
+        sh 'curl -sf http://host.docker.internal:8082/health'
         echo 'Staging health check passed.'
       }
     }
