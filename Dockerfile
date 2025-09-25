@@ -12,12 +12,11 @@ COPY backend ./backend
 ENV PORT=3000
 EXPOSE 3000
 
-# Add a simple healthcheck for faster Monitoring feedback
-HEALTHCHECK --interval=15s --timeout=3s --retries=5 \
-  CMD wget -qO- http://localhost:3000/health || exit 1
+# Single healthcheck using Node.js (no wget dependency)
+HEALTHCHECK --interval=5s --timeout=3s --retries=30 CMD node -e "\
+require('http').get('http://localhost:3000/health', r => {\
+  process.exitCode = (r.statusCode === 200) ? 0 : 1;\
+}).on('error', () => process.exit(1));"
 
 # Start the API (NODE_ENV / MONGO_URL set at runtime)
 CMD ["node", "backend/src/app.js"]
-
-# at the end of Dockerfile
-HEALTHCHECK --interval=5s --timeout=3s --retries=30 CMD node -e "require('http').get('http://localhost:3000/health', r=>{process.exitCode = (r.statusCode===200)?0:1}).on('error',()=>process.exit(1))"
