@@ -4,9 +4,6 @@ pipeline {
   options { timestamps() }
 
   environment {
-    // SonarQube tool name (Manage Jenkins » Global Tool Configuration)
-    SONAR_SCANNER    = 'sonar-scanner-4.8'
-
     // Backend image naming & tagging
     APP_NAME         = 'ecommerce-api'
     APP_VERSION      = "${env.BUILD_NUMBER}"
@@ -26,10 +23,14 @@ pipeline {
     FRONTEND_IMAGE     = "${FRONTEND_NAME}:${env.BUILD_NUMBER}"
     FRONTEND_LATEST    = "${FRONTEND_NAME}:latest"
     FRONTEND_PORT_HOST = '8081'
+
+    // SonarScanner tool name in Jenkins (Global Tool Config)
+    SONAR_SCANNER    = 'sonar-scanner-4.8'
   }
 
   stages {
 
+    // 1) BUILD
     stage('Build') {
       steps {
         ansiColor('xterm') {
@@ -60,6 +61,7 @@ pipeline {
       }
     }
 
+    // 2) TEST
     stage('Test') {
       steps {
         ansiColor('xterm') {
@@ -81,38 +83,44 @@ pipeline {
       }
     }
 
+    // 3) CODE QUALITY
     stage('Code Quality') {
       steps {
         ansiColor('xterm') {
-          // Supplies SONAR_HOST_URL and other env vars
+          // Loads SONAR_HOST_URL and other vars from Jenkins "SonarQube" server config
           withSonarQubeEnv('SonarQube') {
-            // Secret Text credential id: sonarqube-token1 -> env SONAR_TOKEN
+            // Provide token safely (Secret Text credential id: sonarqube-token1)
             withCredentials([string(credentialsId: 'sonarqube-token1', variable: 'SONAR_TOKEN')]) {
               script {
                 def scannerHome = tool env.SONAR_SCANNER
                 def nodeHome    = tool('node18')
 
-                // Put paths into env (not interpolated by Groovy)
                 withEnv([
                   "SCANNER_HOME=${scannerHome}",
                   "NODE_HOME=${nodeHome}",
-                  "NODE_BIN=${nodeHome}/bin/node"
+                  "NODE_BIN=${nodeHome}/bin/node",
+                  // Optional: give the analyzer a bit more heap to avoid slowdowns/timeouts
+                  "SONAR_SCANNER_OPTS=-Xms128m -Xmx1024m"
                 ]) {
                   dir('backend') {
-                    // Rely on env SONAR_HOST_URL (from withSonarQubeEnv) and SONAR_TOKEN (from withCredentials)
-                    // Do NOT pass -Dsonar.host.url=… or -Dsonar.token=… on CLI -> avoids spacing bugs & interpolation
+                    // No Groovy interpolation of secrets; rely on env picked up by the scanner.
+                    // NOTE: Do NOT pass -Dsonar.login or -Dsonar.host.url here; withSonarQubeEnv + SONAR_TOKEN handle it.
                     sh '''#!/bin/bash
 set -euo pipefail
 export PATH="$NODE_HOME/bin:$PATH"
+unset SONAR_LOGIN || true
 
-# Optional: check versions (doesn't echo secrets)
+# Sanity (non-verbose)
 "$SCANNER_HOME/bin/sonar-scanner" -v >/dev/null 2>&1 || true
 "$NODE_BIN" --version || true
 
+# Run scan (sources/tests narrowed for speed & clarity)
 "$SCANNER_HOME/bin/sonar-scanner" \
   -Dsonar.projectKey=ecommerce-backend \
-  -Dsonar.sources=. \
-  -Dsonar.exclusions=tests/**,**/*.test.js,**/node_modules/**,**/dist/** \
+  -Dsonar.sources=src \
+  -Dsonar.tests=tests \
+  -Dsonar.test.inclusions=tests/**/*.test.js \
+  -Dsonar.exclusions=**/node_modules/**,**/dist/** \
   -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info \
   -Dsonar.nodejs.executable="$NODE_BIN"
 '''
@@ -125,6 +133,7 @@ export PATH="$NODE_HOME/bin:$PATH"
       }
     }
 
+    // 4) QUALITY GATE (non-blocking + only on main)
     stage('Quality Gate') {
       when {
         anyOf {
@@ -142,6 +151,7 @@ export PATH="$NODE_HOME/bin:$PATH"
       }
     }
 
+    // 5) SECURITY
     stage('Security') {
       parallel {
         stage('Snyk (deps)') {
@@ -159,7 +169,7 @@ export PATH="$NODE_HOME/bin:$PATH"
             }
           }
         }
-        stage('Trivy (image)') {
+        stage('Trivy (image)) {
           steps {
             ansiColor('xterm') {
               sh '''
@@ -177,6 +187,7 @@ export PATH="$NODE_HOME/bin:$PATH"
       }
     }
 
+    // 6) DEPLOY
     stage('Deploy') {
       steps {
         ansiColor('xterm') {
@@ -247,6 +258,7 @@ export PATH="$NODE_HOME/bin:$PATH"
       }
     }
 
+    // 7) RELEASE
     stage('Release') {
       steps {
         sh '''
@@ -259,6 +271,7 @@ export PATH="$NODE_HOME/bin:$PATH"
       }
     }
 
+    // 8) MONITORING (non-fatal)
     stage('Monitoring') {
       steps {
         ansiColor('xterm') {
