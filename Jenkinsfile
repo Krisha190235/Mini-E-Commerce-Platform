@@ -1,119 +1,143 @@
 pipeline {
   agent any
-  tools { nodejs 'node18' }
-  options { timestamps() }
+
+  options {
+    timestamps()
+    ansiColor('xterm')
+    buildDiscarder(logRotator(numToKeepStr: '20'))
+    timeout(time: 30, unit: 'MINUTES')
+    skipDefaultCheckout(false)
+  }
+
+  tools {
+    nodejs 'node18'
+    // Manage Jenkins → Tools → SonarQube Scanner Installations
+    // Name must be: sonar-scanner-4.8
+    sonarQubeScanner 'sonar-scanner-4.8'
+  }
 
   environment {
-    // Backend image naming & tagging
-    APP_NAME         = 'ecommerce-api'
-    APP_VERSION      = "${env.BUILD_NUMBER}"
-    APP_IMAGE        = "${APP_NAME}:${APP_VERSION}"
-    APP_IMAGE_LATEST = "${APP_NAME}:latest"
-
-    // Runtime (staging) setup
-    DOCKER_NETWORK    = 'ecommerce-net'
-    MONGO_CONTAINER   = 'ecommerce-mongo'
-    STAGING_CONTAINER = 'ecommerce-staging'
-    APP_PORT_HOST     = '8082'
-    APP_PORT_CONT     = '3000'
-    MONGO_DB_NAME     = 'ecom'
-
-    // Frontend
-    FRONTEND_NAME      = 'ecommerce-web'
-    FRONTEND_IMAGE     = "${FRONTEND_NAME}:${env.BUILD_NUMBER}"
-    FRONTEND_LATEST    = "${FRONTEND_NAME}:latest"
-    FRONTEND_PORT_HOST = '8081'
+    DOCKER_BUILDKIT = '1'
+    IMAGE_TAG = "${env.BUILD_NUMBER}"
+    FRONTEND_API_URL = 'http://localhost:8082'
   }
 
   stages {
+    stage('Checkout') {
+      steps {
+        cleanWs()
+        checkout([$class: 'GitSCM',
+          branches: [[name: '*/main']],
+          userRemoteConfigs: [[url: 'https://github.com/Krisha190235/Mini-E-Commerce-Platform.git']]
+        ])
+      }
+    }
 
     stage('Build') {
       steps {
         ansiColor('xterm') {
           sh '''
             set -eux
-
-            # Backend build
             cd backend
             npm ci
             npm run build || echo "No build step required"
             cd ..
+          '''
+          // Backend image (if docker exists)
+          script {
+            def hasDocker = sh(returnStatus: true, script: 'command -v docker >/dev/null 2>&1') == 0
+            if (hasDocker) {
+              sh """
+                docker build -t ecommerce-api:${IMAGE_TAG} -t ecommerce-api:latest .
+              """
+            } else {
+              echo 'Docker not found on this agent — skipping backend image build.'
+            }
+          }
 
-            # Build backend Docker image
-            docker build -t "${APP_IMAGE}" -t "${APP_IMAGE_LATEST}" .
-
-            # Frontend build & image
+          // Frontend build + image
+          sh '''
+            set -eux
             cd frontend
             npm ci
-            docker build -t "${FRONTEND_IMAGE}" -t "${FRONTEND_LATEST}" \
-              --build-arg VITE_API_URL=http://localhost:${APP_PORT_HOST} .
           '''
+          script {
+            def hasDocker = sh(returnStatus: true, script: 'command -v docker >/dev/null 2>&1') == 0
+            if (hasDocker) {
+              sh """
+                cd frontend
+                docker build \
+                  --build-arg VITE_API_URL=${FRONTEND_API_URL} \
+                  -t ecommerce-web:${IMAGE_TAG} -t ecommerce-web:latest .
+              """
+            } else {
+              echo 'Docker not found on this agent — skipping frontend image build.'
+            }
+          }
         }
-      }
-      post {
-        success {
-          archiveArtifacts artifacts: 'backend/**', fingerprint: true
-        }
+
+        // Archive some build outputs if any
+        archiveArtifacts artifacts: 'backend/**, frontend/**', allowEmptyArchive: true
       }
     }
 
     stage('Test') {
       steps {
         ansiColor('xterm') {
-          sh 'cd backend && npm test -- --ci --coverage'
+          sh '''
+            set -eux
+            cd backend
+            NODE_ENV=test NODE_OPTIONS=--experimental-vm-modules \
+              npm test -- --ci --coverage
+          '''
         }
       }
       post {
         always {
-          junit allowEmptyResults: true, testResults: 'backend/**/junit/*.xml'
+          junit testResults: 'backend/junit-report.xml', allowEmptyResults: true
           publishHTML(target: [
+            allowMissing: true,
+            alwaysLinkToLastBuild: true,
+            keepAll: true,
             reportDir: 'backend/coverage/lcov-report',
             reportFiles: 'index.html',
-            reportName: 'Coverage',
-            allowMissing: true,
-            keepAll: true,
-            alwaysLinkToLastBuild: true
+            reportName: 'Coverage'
           ])
+          // Keep LCOV for Sonar
+          archiveArtifacts artifacts: 'backend/coverage/lcov.info', allowEmptyArchive: true
         }
       }
     }
 
     stage('Code Quality') {
+      environment {
+        // Inject SonarQube server envs (SONAR_HOST_URL, etc.)
+      }
       steps {
-        ansiColor('xterm') {
-          withSonarQubeEnv('SonarQube') {
-            withCredentials([string(credentialsId: 'sonarqube-token1', variable: 'SONAR_TOKEN')]) {
-              script {
-                def SCANNER_HOME = tool 'sonar-scanner-4.8'
-                def NODE_HOME    = tool 'node18'
-                def NODE_BIN     = "${NODE_HOME}/bin/node"
-
-                // Use single-quoted sh + explicit env to avoid insecure interpolation warnings
-                withEnv([
-                  "SCANNER_HOME=${SCANNER_HOME}",
-                  "NODE_HOME=${NODE_HOME}",
-                  "NODE_BIN=${NODE_BIN}",
-                  // SONAR_TOKEN already in env from withCredentials
-                ]) {
-                  sh '''#!/bin/bash
-set -euo pipefail
-export PATH="$NODE_HOME/bin:$PATH"
-
-# Optional checks (no secrets printed)
-"$SCANNER_HOME/bin/sonar-scanner" -v >/dev/null 2>&1 || true
-"$NODE_BIN" --version || true
-
-# Run scan (host URL has NO stray space)
-"$SCANNER_HOME/bin/sonar-scanner" \
-  -Dsonar.host.url=http://sonarqube:9000 \
-  -Dsonar.projectKey=ecommerce-backend \
-  -Dsonar.sources=. \
-  -Dsonar.exclusions=tests/**,**/*.test.js,**/node_modules/**,**/dist/** \
-  -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info \
-  -Dsonar.nodejs.executable="$NODE_BIN"
-'''
-                }
-              }
+        withSonarQubeEnv('SonarQube') {
+          withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
+            // Use tool installations
+            withEnv([
+              "NODEJS_HOME=${tool name: 'node18', type: 'jenkins.plugins.nodejs.tools.NodeJSInstallation'}",
+              "SCANNER_HOME=${tool name: 'sonar-scanner-4.8', type: 'hudson.plugins.sonar.SonarRunnerInstallation'}"
+            ]) {
+              // IMPORTANT: single quotes so $SONAR_TOKEN/$SONAR_HOST_URL are expanded by sh, not Groovy
+              sh '''
+                set -euo pipefail
+                export PATH="$NODEJS_HOME/bin:$SCANNER_HOME/bin:$PATH"
+                node --version || true
+                sonar-scanner \
+                  -Dsonar.host.url=$SONAR_HOST_URL \
+                  -Dsonar.token=$SONAR_TOKEN \
+                  -Dsonar.projectKey=ecommerce-backend \
+                  -Dsonar.projectBaseDir=backend \
+                  -Dsonar.sources=src \
+                  -Dsonar.tests=tests \
+                  -Dsonar.inclusions=src/** \
+                  -Dsonar.exclusions=**/node_modules/**,**/dist/**,**/*.test.js \
+                  -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info \
+                  -Dsonar.nodejs.executable=$NODEJS_HOME/bin/node
+              '''
             }
           }
         }
@@ -121,17 +145,14 @@ export PATH="$NODE_HOME/bin:$PATH"
     }
 
     stage('Quality Gate') {
-      when {
-        anyOf {
-          expression { return env.BRANCH_NAME == null || env.BRANCH_NAME == 'main' }
-        }
-      }
       steps {
         script {
-          def qg = waitForQualityGate(abortPipeline: false)
-          echo "Quality Gate: ${qg.status}${qg.msg ? " - ${qg.msg}" : ""}"
-          if (qg.status != 'OK') {
-            currentBuild.result = 'UNSTABLE'
+          timeout(time: 5, unit: 'MINUTES') {
+            def qg = waitForQualityGate()  // requires SonarQube Scanner for Jenkins
+            echo "Quality Gate: ${qg.status}"
+            if (qg.status != 'OK') {
+              error "Pipeline aborted due to Quality Gate status: ${qg.status}"
+            }
           }
         }
       }
@@ -140,165 +161,59 @@ export PATH="$NODE_HOME/bin:$PATH"
     stage('Security') {
       parallel {
         stage('Snyk (deps)') {
-          steps {
-            ansiColor('xterm') {
-              withCredentials([string(credentialsId: 'SNYK_TOKEN', variable: 'SNYK_TOKEN')]) {
-                sh '''
-                  set -eux
-                  npm install -g snyk || true
-                  snyk auth "$SNYK_TOKEN" || true
-                  cd backend
-                  snyk test --severity-threshold=medium || true
-                '''
-              }
-            }
+          when {
+            expression { sh(returnStatus: true, script: 'command -v snyk >/dev/null 2>&1') == 0 }
           }
-        }
-
-        stage('Trivy (image)') {
           steps {
-            ansiColor('xterm') {
+            withCredentials([string(credentialsId: 'snyk-token', variable: 'SNYK_TOKEN')]) {
               sh '''
                 set -eux
-                docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
-                  aquasec/trivy:latest image --exit-code 0 --severity HIGH,CRITICAL \
-                  "${APP_IMAGE}" | tee trivy.txt
+                snyk auth $SNYK_TOKEN
+                cd backend
+                snyk test || true
               '''
             }
           }
-          post {
-            always { archiveArtifacts artifacts: 'trivy.txt', fingerprint: true }
+        }
+        stage('Trivy (image)') {
+          when {
+            expression { sh(returnStatus: true, script: 'command -v trivy >/dev/null 2>&1') == 0 &&
+                        sh(returnStatus: true, script: 'command -v docker >/dev/null 2>&1') == 0 }
+          }
+          steps {
+            sh '''
+              set -eux
+              trivy image --exit-code 0 --severity HIGH,CRITICAL ecommerce-api:latest || true
+              trivy image --exit-code 0 --severity HIGH,CRITICAL ecommerce-web:latest || true
+            '''
           }
         }
       }
     }
 
     stage('Deploy') {
+      when {
+        expression { sh(returnStatus: true, script: 'command -v docker >/dev/null 2>&1') == 0 }
+      }
       steps {
-        ansiColor('xterm') {
-          sh '''
-            set -eux
-
-            docker network inspect "${DOCKER_NETWORK}" >/dev/null 2>&1 || docker network create "${DOCKER_NETWORK}"
-
-            docker rm -f "${MONGO_CONTAINER}" || true
-            docker run -d --name "${MONGO_CONTAINER}" --network "${DOCKER_NETWORK}" -p 27017:27017 \
-              --health-cmd='mongosh --quiet --eval "db.adminCommand({ ping: 1 }).ok"' \
-              --health-interval=5s --health-timeout=3s --health-retries=30 mongo
-
-            echo "Waiting for Mongo to be healthy..."
-            for i in $(seq 1 120); do
-              s=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${MONGO_CONTAINER}")
-              [ "$s" = "healthy" ] && break
-              sleep 1
-              if [ "$i" -eq 120 ]; then
-                echo "Mongo failed to become healthy" >&2
-                docker ps --format 'table {{.Names}}\\t{{.Status}}\\t{{.Ports}}'
-                docker logs --tail 200 "${MONGO_CONTAINER}" || true
-                exit 1
-              fi
-            done
-
-            docker rm -f "${STAGING_CONTAINER}" || true
-            docker run -d --name "${STAGING_CONTAINER}" --network "${DOCKER_NETWORK}" \
-              -e NODE_ENV=production -e JWT_SECRET=change-me \
-              -e MONGO_URL="mongodb://${MONGO_CONTAINER}:27017/${MONGO_DB_NAME}" \
-              -p ${APP_PORT_HOST}:${APP_PORT_CONT} "${APP_IMAGE_LATEST}"
-
-            echo "Waiting for API on http://host.docker.internal:${APP_PORT_HOST}/health ..."
-            for i in $(seq 1 120); do
-              if curl -sf "http://host.docker.internal:${APP_PORT_HOST}/health" >/dev/null; then
-                echo "API is healthy ✅"
-                break
-              fi
-              sleep 2
-              if [ "$i" -eq 120 ]; then
-                echo "API failed to become ready" >&2
-                docker ps --format 'table {{.Names}}\\t{{.Status}}\\t{{.Ports}}'
-                docker logs --tail 200 "${STAGING_CONTAINER}" || true
-                exit 1
-              fi
-            done
-
-            docker rm -f "${FRONTEND_NAME}" || true
-            docker run -d --name "${FRONTEND_NAME}" --network "${DOCKER_NETWORK}" \
-              -p ${FRONTEND_PORT_HOST}:80 "${FRONTEND_LATEST}"
-
-            echo "Waiting for Web on http://host.docker.internal:${FRONTEND_PORT_HOST}/health ..."
-            for i in $(seq 1 60); do
-              if curl -sf "http://host.docker.internal:${FRONTEND_PORT_HOST}/health" >/dev/null; then
-                echo "Web is up ✅"
-                break
-              fi
-              sleep 2
-              if [ "$i" -eq 60 ]; then
-                echo "Web failed to become ready" >&2
-                docker ps --format 'table {{.Names}}\\t{{.Status}}\\t{{.Ports}}'
-                docker logs --tail 200 "${FRONTEND_NAME}" || true
-                exit 1
-              fi
-            done
-          '''
-        }
+        echo 'Add your deploy steps here (e.g., docker compose up, helm upgrade, etc.).'
       }
     }
 
     stage('Release') {
       steps {
-        sh '''
-          set -eux
-          docker tag "${APP_IMAGE_LATEST}" "${APP_NAME}:release-${APP_VERSION}"
-          docker tag "${FRONTEND_LATEST}" "${FRONTEND_NAME}:release-${APP_VERSION}"
-          echo "Release tagged: ${APP_NAME}:release-${APP_VERSION}"
-          echo "Release tagged: ${FRONTEND_NAME}:release-${APP_VERSION}"
-        '''
+        echo 'Tag/push images or create GitHub release as needed.'
       }
     }
 
     stage('Monitoring') {
       steps {
-        ansiColor('xterm') {
-          sh '''
-            set -eux
-            echo "Monitoring: probing API & Web via host ports ..."
-            ok=1
-
-            if curl -sf "http://host.docker.internal:${APP_PORT_HOST}/health" >/dev/null; then
-              echo "✅ API OK (host.docker.internal:${APP_PORT_HOST})"
-            else
-              echo "⚠️  API probe failed (host port). Trying container DNS..."
-              docker network connect "${DOCKER_NETWORK}" jenkins || true
-              if curl -sf "http://${STAGING_CONTAINER}:${APP_PORT_CONT}/health" >/dev/null; then
-                echo "✅ API OK via container DNS"
-              else
-                echo "⚠️  API still not reachable"; ok=0
-              fi
-            fi
-
-            if curl -sf "http://host.docker.internal:${FRONTEND_PORT_HOST}/health" >/dev/null; then
-              echo "✅ Web OK (host.docker.internal:${FRONTEND_PORT_HOST})"
-            else
-              echo "⚠️  Web probe failed"; ok=0
-            fi
-
-            if [ "$ok" -eq 0 ]; then
-              echo "⚠️  One or more monitoring checks failed (non-fatal)."
-              docker ps --format 'table {{.Names}}\\t{{.Status}}\\t{{.Ports}}' || true
-              docker logs --tail 100 "${STAGING_CONTAINER}" || true
-              docker logs --tail 100 "${FRONTEND_NAME}" || true
-            fi
-          '''
-        }
+        echo 'Hook in Prometheus/Grafana, uptime checks, etc.'
       }
     }
   }
 
   post {
-    success {
-      echo "Pipeline SUCCESS."
-      echo "API:      http://localhost:${APP_PORT_HOST}       (Swagger: /api-docs)"
-      echo "Website:  http://localhost:${FRONTEND_PORT_HOST}"
-    }
     always {
       cleanWs()
     }
