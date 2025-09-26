@@ -11,26 +11,22 @@ pipeline {
     APP_IMAGE_LATEST = "${APP_NAME}:latest"
 
     // Runtime (staging) setup
-    DOCKER_NETWORK   = 'ecommerce-net'
-    MONGO_CONTAINER  = 'ecommerce-mongo'
-    STAGING_CONTAINER= 'ecommerce-staging'
-    APP_PORT_HOST    = '8082'
-    APP_PORT_CONT    = '3000'
-    MONGO_DB_NAME    = 'ecom'
+    DOCKER_NETWORK    = 'ecommerce-net'
+    MONGO_CONTAINER   = 'ecommerce-mongo'
+    STAGING_CONTAINER = 'ecommerce-staging'
+    APP_PORT_HOST     = '8082'
+    APP_PORT_CONT     = '3000'
+    MONGO_DB_NAME     = 'ecom'
 
     // Frontend
     FRONTEND_NAME      = 'ecommerce-web'
     FRONTEND_IMAGE     = "${FRONTEND_NAME}:${env.BUILD_NUMBER}"
     FRONTEND_LATEST    = "${FRONTEND_NAME}:latest"
     FRONTEND_PORT_HOST = '8081'
-
-    // SonarScanner tool name in Jenkins (Global Tool Config)
-    SONAR_SCANNER    = 'sonar-scanner-4.8'
   }
 
   stages {
 
-    // 1) BUILD
     stage('Build') {
       steps {
         ansiColor('xterm') {
@@ -43,7 +39,7 @@ pipeline {
             npm run build || echo "No build step required"
             cd ..
 
-            # Build backend Docker image (for scan/deploy)
+            # Build backend Docker image
             docker build -t "${APP_IMAGE}" -t "${APP_IMAGE_LATEST}" .
 
             # Frontend build & image
@@ -61,7 +57,6 @@ pipeline {
       }
     }
 
-    // 2) TEST
     stage('Test') {
       steps {
         ansiColor('xterm') {
@@ -83,48 +78,40 @@ pipeline {
       }
     }
 
-    // 3) CODE QUALITY
     stage('Code Quality') {
       steps {
         ansiColor('xterm') {
-          // Loads SONAR_HOST_URL and other vars from Jenkins "SonarQube" server config
           withSonarQubeEnv('SonarQube') {
-            // Provide token safely (Secret Text credential id: sonarqube-token1)
             withCredentials([string(credentialsId: 'sonarqube-token1', variable: 'SONAR_TOKEN')]) {
               script {
-                def scannerHome = tool env.SONAR_SCANNER
-                def nodeHome    = tool('node18')
+                def SCANNER_HOME = tool 'sonar-scanner-4.8'
+                def NODE_HOME    = tool 'node18'
+                def NODE_BIN     = "${NODE_HOME}/bin/node"
 
+                // Use single-quoted sh + explicit env to avoid insecure interpolation warnings
                 withEnv([
-                  "SCANNER_HOME=${scannerHome}",
-                  "NODE_HOME=${nodeHome}",
-                  "NODE_BIN=${nodeHome}/bin/node",
-                  // Optional: give the analyzer a bit more heap to avoid slowdowns/timeouts
-                  "SONAR_SCANNER_OPTS=-Xms128m -Xmx1024m"
+                  "SCANNER_HOME=${SCANNER_HOME}",
+                  "NODE_HOME=${NODE_HOME}",
+                  "NODE_BIN=${NODE_BIN}",
+                  // SONAR_TOKEN already in env from withCredentials
                 ]) {
-                  dir('backend') {
-                    // No Groovy interpolation of secrets; rely on env picked up by the scanner.
-                    // NOTE: Do NOT pass -Dsonar.login or -Dsonar.host.url here; withSonarQubeEnv + SONAR_TOKEN handle it.
-                    sh '''#!/bin/bash
+                  sh '''#!/bin/bash
 set -euo pipefail
 export PATH="$NODE_HOME/bin:$PATH"
-unset SONAR_LOGIN || true
 
-# Sanity (non-verbose)
+# Optional checks (no secrets printed)
 "$SCANNER_HOME/bin/sonar-scanner" -v >/dev/null 2>&1 || true
 "$NODE_BIN" --version || true
 
-# Run scan (sources/tests narrowed for speed & clarity)
+# Run scan (host URL has NO stray space)
 "$SCANNER_HOME/bin/sonar-scanner" \
+  -Dsonar.host.url=http://sonarqube:9000 \
   -Dsonar.projectKey=ecommerce-backend \
-  -Dsonar.sources=src \
-  -Dsonar.tests=tests \
-  -Dsonar.test.inclusions=tests/**/*.test.js \
-  -Dsonar.exclusions=**/node_modules/**,**/dist/** \
+  -Dsonar.sources=. \
+  -Dsonar.exclusions=tests/**,**/*.test.js,**/node_modules/**,**/dist/** \
   -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info \
   -Dsonar.nodejs.executable="$NODE_BIN"
 '''
-                  }
                 }
               }
             }
@@ -133,7 +120,6 @@ unset SONAR_LOGIN || true
       }
     }
 
-    // 4) QUALITY GATE (non-blocking + only on main)
     stage('Quality Gate') {
       when {
         anyOf {
@@ -151,7 +137,6 @@ unset SONAR_LOGIN || true
       }
     }
 
-    // 5) SECURITY
     stage('Security') {
       parallel {
         stage('Snyk (deps)') {
@@ -169,7 +154,8 @@ unset SONAR_LOGIN || true
             }
           }
         }
-        stage('Trivy (image)) {
+
+        stage('Trivy (image)') {
           steps {
             ansiColor('xterm') {
               sh '''
@@ -187,7 +173,6 @@ unset SONAR_LOGIN || true
       }
     }
 
-    // 6) DEPLOY
     stage('Deploy') {
       steps {
         ansiColor('xterm') {
@@ -258,7 +243,6 @@ unset SONAR_LOGIN || true
       }
     }
 
-    // 7) RELEASE
     stage('Release') {
       steps {
         sh '''
@@ -271,7 +255,6 @@ unset SONAR_LOGIN || true
       }
     }
 
-    // 8) MONITORING (non-fatal)
     stage('Monitoring') {
       steps {
         ansiColor('xterm') {
