@@ -5,8 +5,8 @@ pipeline {
 
   environment {
     // SonarQube
-    SONAR_HOST_URL   = 'http://host.docker.internal:9000'   // change to your reachable URL if different
-    SONAR_SCANNER    = 'sonar-scanner-4.8'                  // Global tool name
+    SONAR_HOST_URL   = 'http://host.docker.internal:9000'   // adjust if needed
+    SONAR_SCANNER    = 'sonar-scanner-4.8'                  // Global Tool name
 
     // Backend image naming & tagging
     APP_NAME         = 'ecommerce-api'
@@ -31,7 +31,6 @@ pipeline {
 
   stages {
 
-    // 1) BUILD
     stage('Build') {
       steps {
         ansiColor('xterm') {
@@ -62,7 +61,6 @@ pipeline {
       }
     }
 
-    // 2) TEST
     stage('Test') {
       steps {
         ansiColor('xterm') {
@@ -84,33 +82,37 @@ pipeline {
       }
     }
 
-    // 3) CODE QUALITY (SonarQube)
+    /* ===== FIXED: no insecure interpolation here ===== */
     stage('Code Quality') {
       steps {
         ansiColor('xterm') {
           withSonarQubeEnv('SonarQube') {
-            // Use your secret text credential that stores the SonarQube user token
             withCredentials([string(credentialsId: 'sonarqube-token1', variable: 'SONAR_TOKEN')]) {
               script {
                 def scannerHome = tool env.SONAR_SCANNER
                 def nodeHome    = tool('node18')
                 def nodeBin     = "${nodeHome}/bin/node"
 
-                dir('backend') {
-                  // No Groovy interpolation of the secret; it's passed via environment at runtime.
-                  sh """
-                    set -eux
-                    export PATH="${nodeHome}/bin:\\$PATH"
-
-                    SONAR_TOKEN="\\$SONAR_TOKEN" \\
-                    "${scannerHome}/bin/sonar-scanner" \\
-                      -Dsonar.host.url=${SONAR_HOST_URL} \\
-                      -Dsonar.projectKey=ecommerce-backend \\
-                      -Dsonar.sources=. \\
-                      -Dsonar.exclusions=tests/**,**/*.test.js,**/node_modules/**,**/dist/** \\
-                      -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info \\
-                      -Dsonar.nodejs.executable=${nodeBin}
-                  """
+                // Provide values to the shell via environment, then use a single-quoted script (no Groovy interpolation)
+                withEnv([
+                  "PATH+NODE=${nodeHome}/bin",
+                  "SCANNER_HOME=${scannerHome}",
+                  "NODE_BIN=${nodeBin}",
+                  "SONAR_HOST_URL_ENV=${env.SONAR_HOST_URL}"
+                ]) {
+                  dir('backend') {
+                    sh '''#!/bin/bash
+set -eux
+# SONAR_TOKEN is injected by withCredentials. Do NOT reference it in Groovy strings.
+SONAR_TOKEN="$SONAR_TOKEN" "$SCANNER_HOME/bin/sonar-scanner" \
+  -Dsonar.host.url=$SONAR_HOST_URL_ENV \
+  -Dsonar.projectKey=ecommerce-backend \
+  -Dsonar.sources=. \
+  -Dsonar.exclusions=tests/**,**/*.test.js,**/node_modules/**,**/dist/** \
+  -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info \
+  -Dsonar.nodejs.executable="$NODE_BIN"
+'''
+                  }
                 }
               }
             }
@@ -118,8 +120,8 @@ pipeline {
         }
       }
     }
+    /* ===== end fix ===== */
 
-    // 4) QUALITY GATE (non-blocking + only on main)
     stage('Quality Gate') {
       when {
         anyOf {
@@ -137,7 +139,6 @@ pipeline {
       }
     }
 
-    // 5) SECURITY
     stage('Security') {
       parallel {
         stage('Snyk (deps)') {
@@ -173,7 +174,6 @@ pipeline {
       }
     }
 
-    // 6) DEPLOY (local staging)
     stage('Deploy') {
       steps {
         ansiColor('xterm') {
@@ -244,7 +244,6 @@ pipeline {
       }
     }
 
-    // 7) RELEASE
     stage('Release') {
       steps {
         sh '''
@@ -257,7 +256,6 @@ pipeline {
       }
     }
 
-    // 8) MONITORING (non-fatal)
     stage('Monitoring') {
       steps {
         ansiColor('xterm') {
