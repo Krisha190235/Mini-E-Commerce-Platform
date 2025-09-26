@@ -5,8 +5,7 @@ pipeline {
 
   environment {
     // SonarQube
-    SONAR_HOST_URL   = 'http://host.docker.internal:9000'   // adjust if needed
-    SONAR_SCANNER    = 'sonar-scanner-4.8'                  // Global Tool name
+    SONAR_SCANNER    = 'sonar-scanner-4.8'   // Global Tool name in Jenkins
 
     // Backend image naming & tagging
     APP_NAME         = 'ecommerce-api'
@@ -15,12 +14,12 @@ pipeline {
     APP_IMAGE_LATEST = "${APP_NAME}:latest"
 
     // Runtime (staging) setup
-    DOCKER_NETWORK    = 'ecommerce-net'
-    MONGO_CONTAINER   = 'ecommerce-mongo'
-    STAGING_CONTAINER = 'ecommerce-staging'
-    APP_PORT_HOST     = '8082'
-    APP_PORT_CONT     = '3000'
-    MONGO_DB_NAME     = 'ecom'
+    DOCKER_NETWORK   = 'ecommerce-net'
+    MONGO_CONTAINER  = 'ecommerce-mongo'
+    STAGING_CONTAINER= 'ecommerce-staging'
+    APP_PORT_HOST    = '8082'
+    APP_PORT_CONT    = '3000'
+    MONGO_DB_NAME    = 'ecom'
 
     // Frontend
     FRONTEND_NAME      = 'ecommerce-web'
@@ -31,6 +30,7 @@ pipeline {
 
   stages {
 
+    // 1) BUILD
     stage('Build') {
       steps {
         ansiColor('xterm') {
@@ -61,6 +61,7 @@ pipeline {
       }
     }
 
+    // 2) TEST
     stage('Test') {
       steps {
         ansiColor('xterm') {
@@ -82,35 +83,40 @@ pipeline {
       }
     }
 
-    /* ===== FIXED: no insecure interpolation here ===== */
+    // 3) CODE QUALITY (SonarQube)
     stage('Code Quality') {
       steps {
         ansiColor('xterm') {
-          withSonarQubeEnv('SonarQube') {
+          withSonarQubeEnv('SonarQube') { // provides $SONAR_HOST_URL
             withCredentials([string(credentialsId: 'sonarqube-token1', variable: 'SONAR_TOKEN')]) {
               script {
-                def scannerHome = tool env.SONAR_SCANNER
+                def scannerHome = tool env.SONAR_SCANNER   // e.g. sonar-scanner-4.8
                 def nodeHome    = tool('node18')
-                def nodeBin     = "${nodeHome}/bin/node"
 
-                // Provide values to the shell via environment, then use a single-quoted script (no Groovy interpolation)
                 withEnv([
-                  "PATH+NODE=${nodeHome}/bin",
                   "SCANNER_HOME=${scannerHome}",
-                  "NODE_BIN=${nodeBin}",
-                  "SONAR_HOST_URL_ENV=${env.SONAR_HOST_URL}"
+                  "NODE_HOME=${nodeHome}"
                 ]) {
                   dir('backend') {
+                    // SINGLE-QUOTED shell to avoid Groovy interpolation of $SONAR_TOKEN
                     sh '''#!/bin/bash
-set -eux
-# SONAR_TOKEN is injected by withCredentials. Do NOT reference it in Groovy strings.
-SONAR_TOKEN="$SONAR_TOKEN" "$SCANNER_HOME/bin/sonar-scanner" \
-  -Dsonar.host.url=$SONAR_HOST_URL_ENV \
+set -euo pipefail
+
+# Ensure Node is on PATH for SonarJS
+export PATH="$NODE_HOME/bin:$PATH"
+
+# Optional: show scanner version (safe)
+"$SCANNER_HOME/bin/sonar-scanner" -v >/dev/null 2>&1 || true
+
+# Run scan (NO spaces after '=')
+"$SCANNER_HOME/bin/sonar-scanner" \
+  -Dsonar.host.url=$SONAR_HOST_URL \
+  -Dsonar.token=$SONAR_TOKEN \
   -Dsonar.projectKey=ecommerce-backend \
   -Dsonar.sources=. \
   -Dsonar.exclusions=tests/**,**/*.test.js,**/node_modules/**,**/dist/** \
   -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info \
-  -Dsonar.nodejs.executable="$NODE_BIN"
+  -Dsonar.nodejs.executable="$NODE_HOME/bin/node"
 '''
                   }
                 }
@@ -120,8 +126,8 @@ SONAR_TOKEN="$SONAR_TOKEN" "$SCANNER_HOME/bin/sonar-scanner" \
         }
       }
     }
-    /* ===== end fix ===== */
 
+    // 4) QUALITY GATE (non-blocking + only on main)
     stage('Quality Gate') {
       when {
         anyOf {
@@ -139,12 +145,14 @@ SONAR_TOKEN="$SONAR_TOKEN" "$SCANNER_HOME/bin/sonar-scanner" \
       }
     }
 
+    // 5) SECURITY
     stage('Security') {
       parallel {
         stage('Snyk (deps)') {
           steps {
             ansiColor('xterm') {
               withCredentials([string(credentialsId: 'SNYK_TOKEN', variable: 'SNYK_TOKEN')]) {
+                // SINGLE-QUOTED shell (no Groovy interpolation)
                 sh '''
                   set -eux
                   npm install -g snyk || true
@@ -174,6 +182,7 @@ SONAR_TOKEN="$SONAR_TOKEN" "$SCANNER_HOME/bin/sonar-scanner" \
       }
     }
 
+    // 6) DEPLOY (local staging)
     stage('Deploy') {
       steps {
         ansiColor('xterm') {
@@ -244,6 +253,7 @@ SONAR_TOKEN="$SONAR_TOKEN" "$SCANNER_HOME/bin/sonar-scanner" \
       }
     }
 
+    // 7) RELEASE (local tags)
     stage('Release') {
       steps {
         sh '''
@@ -256,6 +266,7 @@ SONAR_TOKEN="$SONAR_TOKEN" "$SCANNER_HOME/bin/sonar-scanner" \
       }
     }
 
+    // 8) MONITORING (non-fatal)
     stage('Monitoring') {
       steps {
         ansiColor('xterm') {
